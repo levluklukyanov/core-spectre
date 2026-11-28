@@ -80,15 +80,9 @@ public static class FontService
         }
 
         // 2. Резервный путь в AppData пользователя (для переносимого single-file exe)
-        string appDataFontsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CoreSpectre",
-            "Fonts");
-
-        if (DirectoryHasAllFonts(appDataFontsDir))
-        {
-            return appDataFontsDir;
-        }
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!Path.IsPathFullyQualified(localAppData)) return baseDir;
+        string appDataFontsDir = Path.Combine(localAppData, "CoreSpectre", "Fonts");
 
         // 3. Извлекаем из внедренных ресурсов сборки (EmbeddedResources)
         try
@@ -107,14 +101,20 @@ public static class FontService
                     }
 
                     string destFile = Path.Combine(appDataFontsDir, fileName);
-                    if (!File.Exists(destFile))
+                    using var stream = asm.GetManifestResourceStream(resName);
+                    if (stream == null) continue;
+                    var cached = new FileInfo(destFile);
+                    if (cached.Exists && cached.Length == stream.Length) continue;
+
+                    string tempFile = destFile + $".tmp.{Guid.NewGuid():N}";
+                    try
                     {
-                        using var stream = asm.GetManifestResourceStream(resName);
-                        if (stream != null)
-                        {
-                            using var fs = File.Create(destFile);
-                            stream.CopyTo(fs);
-                        }
+                        using (var fs = File.Create(tempFile)) stream.CopyTo(fs);
+                        File.Move(tempFile, destFile, overwrite: true);
+                    }
+                    finally
+                    {
+                        try { File.Delete(tempFile); } catch (IOException) { } catch (UnauthorizedAccessException) { }
                     }
                 }
             }

@@ -2,12 +2,15 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using CoreSpectre.Services;
 using CoreSpectre.Views;
 using Xunit;
 
 namespace CoreSpectre.Tests;
 
+[Collection("Settings files")]
 public class UiLoadingTests
 {
     [Fact]
@@ -64,18 +67,35 @@ public class UiLoadingTests
                 hud.Close();
 
                 // Test theme switching (Light and Dark)
-                mainWindow.SetTheme(isLight: true);
-                mainWindow.SetTheme(isLight: false);
+                var currentApp = Application.Current;
+                Assert.NotNull(currentApp);
+                foreach (bool isLight in new[] { true, false })
+                {
+                    mainWindow.SetTheme(isLight);
+                    var scrollbar = new ScrollBar
+                    {
+                        Style = (Style)currentApp.FindResource(typeof(ScrollBar)),
+                        Orientation = Orientation.Horizontal
+                    };
+                    scrollbar.ApplyTemplate();
+                    var track = Assert.IsType<Track>(scrollbar.Template.FindName("PART_Track", scrollbar));
+                    Assert.False(track.IsDirectionReversed);
+                    Assert.Equal(4, scrollbar.Height);
+                    Assert.Same(ScrollBar.PageLeftCommand, track.DecreaseRepeatButton.Command);
+                    Assert.Same(ScrollBar.PageRightCommand, track.IncreaseRepeatButton.Command);
+                }
 
                 // Test language switching and CPU/RAM mode toggle
                 mainWindow.SetLanguage("RU");
+                Assert.EndsWith(" сек", mainWindow.ViewSettings.TxtIntervalCurrent.Text);
+                Assert.EndsWith(" ГБ", mainWindow.ViewSettings.TxtThresholdCurrent.Text);
                 mainWindow.SetPurgeTabMode(isCpu: true, saveSettings: false);
                 mainWindow.SetPurgeTabMode(isCpu: false, saveSettings: false);
                 mainWindow.SetLanguage("EN");
+                Assert.EndsWith("s", mainWindow.ViewSettings.TxtIntervalCurrent.Text);
+                Assert.EndsWith(" GB", mainWindow.ViewSettings.TxtThresholdCurrent.Text);
 
                 // Verify required navigation icons exist in active theme
-                var currentApp = Application.Current;
-                Assert.NotNull(currentApp);
                 Assert.NotNull(currentApp.TryFindResource("IconSquaresFour"));
                 Assert.NotNull(currentApp.TryFindResource("IconCpu"));
                 Assert.NotNull(currentApp.TryFindResource("IconRam"));
@@ -91,14 +111,6 @@ public class UiLoadingTests
                 Assert.Matches(@"^\d{2}:\d{2}:\d{2} (AM|PM) \(UTC[+-]\d+(?::\d{2})?\)$", clockTb.Text);
 
                 // Verify CompactOS Enabling state survives MainWindow.SetLanguage even while Storage tab is collapsed
-                mainWindow.WindowState = WindowState.Normal;
-                mainWindow.Width = 900;
-                mainWindow.Height = 600;
-                mainWindow.ShowActivated = false;
-                mainWindow.ShowInTaskbar = false;
-                mainWindow.Left = -10000;
-                mainWindow.Top = -10000;
-                mainWindow.Show();
                 mainWindow.HighlightTab(2);
                 mainWindow.ViewStorage.CompactOsState = CompactOsState.Enabling;
                 mainWindow.HighlightTab(4);
@@ -165,20 +177,6 @@ public class UiLoadingTests
 
                 LocalizationService.CurrentLanguage = "EN";
                 var storageView = new StorageView();
-                var hostWindow = new Window
-                {
-                    Content = storageView,
-                    Width = 900,
-                    Height = 650,
-                    ShowActivated = false,
-                    ShowInTaskbar = false,
-                    WindowStyle = WindowStyle.None,
-                    Left = -10000,
-                    Top = -10000
-                };
-                hostWindow.Show();
-                hostWindow.UpdateLayout();
-
                 storageView.CompactOsState = CompactOsState.Enabling;
                 Assert.False(storageView.CanExecuteCompactOs);
                 Assert.False(storageView.BtnCompactOs.IsEnabled);
@@ -210,7 +208,6 @@ public class UiLoadingTests
                 Assert.Equal("CompactOS: On", storageView.CompactOsButtonText);
 
                 storageView.StopAutoScan();
-                hostWindow.Close();
             }
             catch (Exception ex)
             {

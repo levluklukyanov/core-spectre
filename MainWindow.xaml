@@ -32,7 +32,7 @@
         <!-- ============================================================ -->
         <!-- 1. HEADER / TITLEBAR                                         -->
         <!-- ============================================================ -->
-        <Border Grid.Row="0" Background="{DynamicResource BrushBgBase}" BorderBrush="{DynamicResource BrushBorder}" BorderThickness="0,0,0,1" MouseLeftButtonDown="Header_MouseLeftButtonDown">
+        <Border x:Name="BackgroundHeader" Grid.Row="0" Background="{DynamicResource BrushBgBase}" BorderBrush="{DynamicResource BrushBorder}" BorderThickness="0,0,0,1" MouseLeftButtonDown="Header_MouseLeftButtonDown">
             <Grid Margin="18,0">
                 <Grid.ColumnDefinitions>
                     <!-- Brand -->
@@ -117,7 +117,7 @@
         <!-- ============================================================ -->
         <!-- 2. BODY: SIDEBAR NAV + CONTENT WORKSPACE                     -->
         <!-- ============================================================ -->
-        <Grid Grid.Row="1">
+        <Grid x:Name="BackgroundWorkspace" Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <!-- Modern Fixed Width Sidebar -->
                 <ColumnDefinition Width="220"/>
@@ -148,10 +148,14 @@
         <!-- ============================================================ -->
         <!-- 3. FOOTER STATUS BAR                                         -->
         <!-- ============================================================ -->
-        <Border Grid.Row="2" Background="{DynamicResource BrushBgBase}" BorderBrush="{DynamicResource BrushBorder}" BorderThickness="0,1,0,0">
+        <Border x:Name="BackgroundFooter" Grid.Row="2" Background="{DynamicResource BrushBgBase}" BorderBrush="{DynamicResource BrushBorder}" BorderThickness="0,1,0,0">
             <Grid Margin="18,0">
-                <TextBlock x:Name="StatusFooterText" Text="" FontSize="11.5" Foreground="{DynamicResource BrushTextSecondary}" VerticalAlignment="Center"/>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="StatusFooterText" Text="" FontSize="11.5" Foreground="{DynamicResource BrushTextSecondary}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,12,0" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
                     <Path Data="{StaticResource IconClock}" Width="12" Height="12" Fill="{DynamicResource BrushTextMuted}" Stretch="Uniform" Margin="0,0,6,0" VerticalAlignment="Center"/>
                     <TextBlock x:Name="FooterClockText" Text="--:--:-- (UTC+0)" FontSize="11" Foreground="{DynamicResource BrushTextSecondary}" VerticalAlignment="Center"/>
                 </StackPanel>
@@ -161,7 +165,7 @@
         <!-- ============================================================ -->
         <!-- 4. MODERN MODAL CONFIRMATION DIALOG OVERLAY                  -->
         <!-- ============================================================ -->
-        <Grid x:Name="ModernModalOverlay" Grid.RowSpan="3" Visibility="Collapsed" Panel.ZIndex="9999" Background="#CC0A0D14">
+        <Grid x:Name="ModernModalOverlay" Grid.RowSpan="3" Visibility="Collapsed" Panel.ZIndex="9999" Background="#CC0A0D14" KeyboardNavigation.TabNavigation="Cycle">
             <Border HorizontalAlignment="Center" VerticalAlignment="Center"
                     Background="{DynamicResource BrushBgSurface}"
                     BorderBrush="{DynamicResource BrushBorderCard}"
@@ -181,7 +185,7 @@
                             <Path x:Name="ModalIconPath" Data="{StaticResource IconInfo}" Width="18" Height="18" Fill="{DynamicResource BrushTextPrimary}" Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Border>
                         <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                            <TextBlock x:Name="ModalDialogTitle" Text="Подтверждение" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}"/>
+                             <TextBlock x:Name="ModalDialogTitle" Text="Подтверждение" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" TextWrapping="Wrap"/>
                             <TextBlock x:Name="ModalDialogSub" Text="Действие требует подтверждения" FontSize="11.5" Foreground="{DynamicResource BrushTextMuted}" Margin="0,3,0,0"/>
                         </StackPanel>
                     </Grid>

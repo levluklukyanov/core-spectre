@@ -89,8 +89,6 @@ public partial class TelemetryHudWindow : Window
     public void ApplySnapshot(TelemetrySnapshot sample)
     {
         if (!IsVisible) return;
-        _lastPushedSnapshotUtc = DateTime.UtcNow;
-
         string targetDrive = string.IsNullOrWhiteSpace(_hudDriveLetter)
             ? sample.SystemDriveLetter
             : _hudDriveLetter;
@@ -98,29 +96,27 @@ public partial class TelemetryHudWindow : Window
         double freeGb;
         if (targetDrive.Equals(sample.SystemDriveLetter, StringComparison.OrdinalIgnoreCase))
         {
+            if (sample.DiskCTotalGb <= 0) return;
             freeGb = sample.DiskCFreeGb;
         }
         else if (sample.HasSecondaryDataDrive && targetDrive.Equals(sample.DataDriveLetter, StringComparison.OrdinalIgnoreCase))
         {
             freeGb = sample.DiskDFreeGb;
         }
-        else
-        {
-            var di = StorageService.GetDriveInfo(targetDrive);
-            freeGb = di != null ? (double)di.FreeBytes / (1024 * 1024 * 1024) : sample.DiskCFreeGb;
-        }
+        else return; // This drive is sampled by the HUD's worker, not by the UI thread.
 
+        _lastPushedSnapshotUtc = DateTime.UtcNow;
         RenderSnapshot(sample, targetDrive, freeGb);
     }
 
-    private void RenderSnapshot(TelemetrySnapshot sample, string targetDrive, double freeGb)
+    private void RenderSnapshot(TelemetrySnapshot sample, string targetDrive, double? freeGb)
     {
         bool isEn = LocalizationService.IsEnglish;
 
         HudCpuText.Text = $"{sample.CpuLoadPercent:0}%";
         HudRamText.Text = sample.RamTotalBytes > 0 ? $"{sample.RamUsedPercent:0}%" : "N/A";
         HudDiskLabel.Text = $"{targetDrive}: ";
-        HudDiskText.Text = isEn ? $"{freeGb:0.#}G" : $"{freeGb:0.#}Г";
+        HudDiskText.Text = freeGb == null ? "—" : isEn ? $"{freeGb:0.#}G" : $"{freeGb:0.#}Г";
 
         var gpuParts = new List<string>(2);
         if (sample.GpuLoadPercent.HasValue) gpuParts.Add($"{sample.GpuLoadPercent.Value:0}%");
@@ -162,14 +158,16 @@ public partial class TelemetryHudWindow : Window
 
         try
         {
-            string targetDrive = string.IsNullOrWhiteSpace(_hudDriveLetter)
+            string selectedDrive = _hudDriveLetter;
+            DateTime lastPush = _lastPushedSnapshotUtc;
+            string targetDrive = string.IsNullOrWhiteSpace(selectedDrive)
                 ? HardwareTelemetry.GetSystemDriveLetter()
-                : _hudDriveLetter;
+                : selectedDrive;
 
             var (sample, driveInfo) = await Task.Run(() =>
                 (HardwareTelemetry.Sample(includeSensors: true), StorageService.GetDriveInfo(targetDrive)));
-            double freeGb = driveInfo != null ? (double)driveInfo.FreeBytes / (1024 * 1024 * 1024) : sample.DiskCFreeGb;
-            RenderSnapshot(sample, targetDrive, freeGb);
+            if (IsVisible && selectedDrive == _hudDriveLetter && lastPush == _lastPushedSnapshotUtc)
+                RenderSnapshot(sample, targetDrive, driveInfo?.FreeBytes / (1024.0 * 1024 * 1024));
         }
         catch (Exception ex)
         {
@@ -189,14 +187,14 @@ public partial class TelemetryHudWindow : Window
         int extendedStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
         if (!_isClickThrough)
         {
-            SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle | WS_EX_TRANSPARENT);
+            if (SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle | WS_EX_TRANSPARENT) == 0 && Marshal.GetLastPInvokeError() != 0) return;
             _isClickThrough = true;
             HudLockIcon.Data = (Geometry)FindResource("IconLock");
             HudLockIcon.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "BrushTextPrimary");
         }
         else
         {
-            SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle & ~WS_EX_TRANSPARENT);
+            if (SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle & ~WS_EX_TRANSPARENT) == 0 && Marshal.GetLastPInvokeError() != 0) return;
             _isClickThrough = false;
             HudLockIcon.Data = (Geometry)FindResource("IconLockOpen");
             HudLockIcon.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "BrushTextMuted");
@@ -216,9 +214,12 @@ public partial class TelemetryHudWindow : Window
                 .ToList();
             if (fixedDrives.Count == 0) return;
 
-            string current = string.IsNullOrWhiteSpace(_hudDriveLetter) ? fixedDrives[0] : _hudDriveLetter;
+            string current = string.IsNullOrWhiteSpace(_hudDriveLetter) ? HardwareTelemetry.GetSystemDriveLetter() : _hudDriveLetter;
             int idx = fixedDrives.FindIndex(d => d.Equals(current, StringComparison.OrdinalIgnoreCase));
             _hudDriveLetter = fixedDrives[(idx + 1) % fixedDrives.Count];
+            _lastPushedSnapshotUtc = DateTime.MinValue;
+            HudDiskLabel.Text = $"{_hudDriveLetter}: ";
+            HudDiskText.Text = "—";
             OnDriveChanged?.Invoke(_hudDriveLetter);
             _ = RefreshMetricsAsync(forceRefresh: true);
         }

@@ -27,7 +27,7 @@ public enum ProcessSortMode
 
 public static class ProcessTrackerService
 {
-    private static readonly Dictionary<int, (TimeSpan TotalTime, DateTime SampleTime)> _previousTimes = new();
+    private static readonly Dictionary<int, (TimeSpan TotalTime, long SampleTime, double CpuPercent)> _previousTimes = new();
     private static readonly object _lock = new();
 
     private static readonly HashSet<string> CriticalProcessNames = new(StringComparer.OrdinalIgnoreCase)
@@ -39,14 +39,15 @@ public static class ProcessTrackerService
 
     public static List<ProcessItemInfo> SampleProcesses(ProcessSortMode sortMode, string filter = "")
     {
-        var now = DateTime.UtcNow;
-        var processes = Process.GetProcesses();
         int processorCount = Math.Max(1, Environment.ProcessorCount);
-        var list = new List<ProcessItemInfo>(processes.Length);
-        var activePids = new HashSet<int>(processes.Length);
+        List<ProcessItemInfo> list;
 
         lock (_lock)
         {
+            long now = Stopwatch.GetTimestamp();
+            var processes = Process.GetProcesses();
+            list = new List<ProcessItemInfo>(processes.Length);
+            var activePids = new HashSet<int>(processes.Length);
             foreach (var proc in processes)
             {
                 try
@@ -69,16 +70,18 @@ public static class ProcessTrackerService
                         priority = MapPriority(proc.BasePriority);
 
                         var totalTime = proc.TotalProcessorTime;
-                        if (_previousTimes.TryGetValue(pid, out var prev))
+                        if (_previousTimes.TryGetValue(pid, out var prev) && totalTime >= prev.TotalTime)
                         {
-                            double timeDiffMs = (now - prev.SampleTime).TotalMilliseconds;
+                            double timeDiffMs = Stopwatch.GetElapsedTime(prev.SampleTime, now).TotalMilliseconds;
                             if (timeDiffMs > 100)
                             {
                                 double cpuDiffMs = (totalTime - prev.TotalTime).TotalMilliseconds;
                                 cpuPercent = Math.Clamp((cpuDiffMs / (timeDiffMs * processorCount)) * 100.0, 0.0, 100.0);
+                                _previousTimes[pid] = (totalTime, now, cpuPercent);
                             }
+                            else cpuPercent = prev.CpuPercent;
                         }
-                        _previousTimes[pid] = (totalTime, now);
+                        else _previousTimes[pid] = (totalTime, now, 0);
                     }
                     catch (Exception ex)
                     {
@@ -110,6 +113,8 @@ public static class ProcessTrackerService
                         HasWindow = !string.IsNullOrWhiteSpace(windowTitle)
                     });
                 }
+                catch (InvalidOperationException) { }
+                catch (System.ComponentModel.Win32Exception) { }
                 finally
                 {
                     proc.Dispose();

@@ -57,8 +57,8 @@ public static class HardwareTelemetry
     private static string? _nvidiaSmiPath = null;
     private static bool _nvidiaSmiProbed = false;
     private static DateTime _lastSensorSampleUtc = DateTime.MinValue;
-    private static double? _cachedGpuLoad = null;
-    private static double? _cachedGpuTemp = null;
+    private sealed record GpuReading(double? Load, double? Temperature);
+    private static volatile GpuReading _cachedGpu = new(null, null);
 
     public static bool IsRussianLanguage { get; set; }
 
@@ -200,6 +200,7 @@ public static class HardwareTelemetry
             ramHist = _ramHistory.ToArray();
         }
 
+        var gpu = _cachedGpu;
         return new TelemetrySnapshot(
             cpuRounded,
             ramRounded,
@@ -214,8 +215,8 @@ public static class HardwareTelemetry
             hasSecondary,
             isGame,
             gameName,
-            _cachedGpuLoad,
-            _cachedGpuTemp,
+            gpu.Load,
+            gpu.Temperature,
             cpuHist,
             ramHist
         );
@@ -238,7 +239,7 @@ public static class HardwareTelemetry
                         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"),
                         Path.Combine(Environment.SystemDirectory, "nvidia-smi.exe")
                     ];
-                    _nvidiaSmiPath = candidates.FirstOrDefault(File.Exists);
+                    _nvidiaSmiPath = candidates.FirstOrDefault(path => Path.IsPathFullyQualified(path) && File.Exists(path));
                 }
 
                 if (!string.IsNullOrEmpty(_nvidiaSmiPath))
@@ -253,12 +254,24 @@ public static class HardwareTelemetry
                     using var p = Process.Start(psi);
                     if (p != null)
                     {
-                        var readTask = p.StandardOutput.ReadToEndAsync();
+                        using var reader = p.StandardOutput;
+                        using var readCts = new CancellationTokenSource();
+                        var readTask = reader.ReadToEndAsync(readCts.Token);
                         if (!p.WaitForExit(800))
                         {
                             try { p.Kill(entireProcessTree: true); } catch { }
                         }
-                        string output = readTask.Wait(200) ? readTask.Result : "";
+                        string output = "";
+                        if (readTask.Wait(200))
+                        {
+                            output = readTask.GetAwaiter().GetResult();
+                        }
+                        else
+                        {
+                            readCts.Cancel();
+                            _ = readTask.ContinueWith(static t => { _ = t.Exception; }, CancellationToken.None,
+                                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                        }
                         string line = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
                         var parts = line.Split(',');
                         if (parts.Length >= 2)
@@ -278,8 +291,7 @@ public static class HardwareTelemetry
                 nvidiaUtil = TryPollWindowsGpuEngineUtil();
             }
 
-            _cachedGpuLoad = nvidiaUtil;
-            _cachedGpuTemp = nvidiaTemp;
+            _cachedGpu = new GpuReading(nvidiaUtil, nvidiaTemp);
         }
     }
 
@@ -311,13 +323,16 @@ public static class HardwareTelemetry
                 {
                     if (!_gpuEngineCounters.ContainsKey(inst))
                     {
+                        PerformanceCounter? pc = null;
                         try
                         {
-                            var pc = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, readOnly: true);
+                            pc = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, readOnly: true);
                             _ = pc.NextValue(); // Warm up baseline sample
                             _gpuEngineCounters[inst] = pc;
+                            pc = null; // Ownership transferred to the cache.
                         }
                         catch { }
+                        finally { pc?.Dispose(); }
                     }
                 }
             }

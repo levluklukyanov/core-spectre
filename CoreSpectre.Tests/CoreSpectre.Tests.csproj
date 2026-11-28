@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <RuntimeHostConfigurationOption Include="CoreSpectre.LogDirectory" Value="$(MSBuildProjectDirectory)\obj\test-logs" />
   </ItemGroup>
 
 </Project>

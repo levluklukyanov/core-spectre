@@ -23,7 +23,8 @@ public enum CompactOsState
     Off,
     On,
     Enabling,
-    Disabling
+    Disabling,
+    Unknown
 }
 
 public record CleanTargetItem(string Key, string Name, string Path, string FormattedSize, long Bytes, bool IsSelected = true, bool RequiresAdmin = false);
@@ -33,7 +34,10 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
     private bool _isStorageOperationRunning = false;
     private bool _isScanningTargets = false;
     private bool _isCompactOsPromptOpen = false;
-    private CompactOsState _compactOsState = CompactOsState.Off;
+    private CompactOsState _compactOsState = CompactOsState.Unknown;
+    private readonly CancellationTokenSource _compactLifetime = new();
+    private Task<bool?>? _compactQuery;
+    private bool _stopped;
     private int _analyzerViewMode = 0; // 0 = Targets, 1 = Large Folders, 2 = Large Files & Backups
     private int _storageCooldownRemaining = 0;
     private DispatcherTimer? _storageCooldownTimer;
@@ -76,6 +80,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
         CompactOsState.On => LocalizationService.Get("Storage.CompactOsOn"),
         CompactOsState.Enabling => LocalizationService.Get("Storage.CompactOsEnabling"),
         CompactOsState.Disabling => LocalizationService.Get("Storage.CompactOsDisabling"),
+        CompactOsState.Unknown => LocalizationService.IsEnglish ? "CompactOS: Unknown" : "CompactOS: Неизвестно",
         _ => LocalizationService.Get("Storage.CompactOsOff")
     };
 
@@ -120,15 +125,26 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
                 await ScanJunkAsync(showLog: false, isManualClick: false, isBackground: true);
             }
         };
-        _autoScanTimer.Start();
-        _ = RefreshCompactOsButtonAsync();
+        IsVisibleChanged += (_, _) =>
+        {
+            if (_stopped) return;
+            if (IsVisible) _autoScanTimer.Start();
+            else _autoScanTimer.Stop();
+            if (IsVisible && CompactOsState == CompactOsState.Unknown && !_isCompactOsPromptOpen)
+                _ = RefreshCompactOsButtonAsync();
+        };
     }
 
     public void StopAutoScan()
     {
+        if (_stopped) return;
+        _stopped = true;
         _autoScanTimer.Stop();
+        _storageCooldownTimer?.Stop();
         _cleanupCts?.Cancel();
         _analyzerCts?.Cancel();
+        _compactLifetime.Cancel();
+        _compactLifetime.Dispose();
     }
 
     public void BindSettings(UserSettingsModel settings, Action saveCallback)
@@ -177,10 +193,13 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
             _ => LocalizationService.Get("Storage.Targets")
         };
         BtnScanJunkText.Text = LocalizationService.Get("Storage.ScanBtn");
-        if (_storageCooldownRemaining <= 0 && !_isStorageOperationRunning)
-        {
-            BtnCleanSystemText.Text = LocalizationService.Get("Storage.CleanBtn");
-        }
+        BtnCleanSystemText.Text = _isStorageOperationRunning ? (isEn ? "Cleaning..." : "Очистка...")
+            : _storageCooldownRemaining > 0 ? (isEn ? $"Cooldown ({_storageCooldownRemaining}s)" : $"Ожидание ({_storageCooldownRemaining} сек)")
+            : LocalizationService.Get("Storage.CleanBtn");
+        BtnStorageDiskDropdown.ToolTip = isEn ? "Select Drive" : "Выбрать диск";
+        BtnTempAgeFilter.ToolTip = isEn ? "Only delete Temp files older than N days" : "Удалять только временные файлы старше N дней";
+        BtnLargeFoldersMode.ToolTip = isEn ? "Analyze large folders, files and backups" : "Анализировать крупные папки, файлы и бэкапы";
+        BtnSortTargets.ToolTip = isEn ? "Sort Targets" : "Сортировать цели";
         BtnCancelCleanupText.Text = isEn ? "Cancel" : "Отмена";
         BtnRollbackSystemText.Text = LocalizationService.Get("Storage.RollbackBtn");
         TxtLargeFoldersMode.Text = _analyzerViewMode switch
@@ -204,19 +223,21 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
         UpdateSortButtonText();
         OnPropertyChanged(nameof(CompactOsButtonText));
-        if (CanExecuteCompactOs)
-        {
-            _ = RefreshCompactOsButtonAsync();
-        }
     }
 
     public void UpdateCapacity(string driveLetter, double freeGb, double totalGb)
     {
-        _watchedDriveLetter = StorageService.ValidateDriveLetter(driveLetter, "C");
+        string letter = StorageService.ValidateDriveLetter(driveLetter, "C");
+        if (_watchedDriveLetter != letter)
+        {
+            _watchedDriveLetter = letter;
+            if (_analyzerViewMode != 0) _ = RefreshAnalyzerAsync();
+        }
         bool isEn = LocalizationService.IsEnglish;
 
+        StorageTabHeading.Text = isEn ? $"Storage & System Cleanup ({letter}:)" : $"Хранилище и системная очистка ({letter}:)";
         StorageGaugeTitle.Text = isEn ? $"Storage Capacity ({_watchedDriveLetter}:):" : $"Емкость накопителя ({_watchedDriveLetter}:):";
-        StorageHeaderStatus.Text = isEn
+        StorageHeaderStatus.Text = totalGb <= 0 ? (isEn ? "Drive unavailable" : "Диск недоступен") : isEn
             ? $"Free: {freeGb:0.0} GB of {totalGb:0.0} GB"
             : $"Свободно: {freeGb:0.0} ГБ из {totalGb:0.0} ГБ";
 
@@ -266,8 +287,25 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
         try
         {
-            var settingsSnapshot = _settings;
-            var targets = await Task.Run(() => StorageService.ScanTempLocations(isEn, settingsSnapshot));
+            var settingsSnapshot = new UserSettingsModel
+            {
+                CleanTempFiles = _settings.CleanTempFiles,
+                CleanSoftwareDistribution = _settings.CleanSoftwareDistribution,
+                CleanLogsAndReports = _settings.CleanLogsAndReports,
+                CleanRecycleBin = _settings.CleanRecycleBin,
+                CleanGpuShaderCache = _settings.CleanGpuShaderCache,
+                CleanBrowserCache = _settings.CleanBrowserCache,
+                TempMinAgeDays = _settings.TempMinAgeDays,
+                DisabledCleanupTargets = [.. _settings.DisabledCleanupTargets]
+            };
+            List<CleanableTarget> targets;
+            do
+            {
+                isEn = LocalizationService.IsEnglish;
+                bool scanInEnglish = isEn;
+                targets = await Task.Run(() => StorageService.ScanTempLocations(scanInEnglish, settingsSnapshot));
+                if (_stopped) return;
+            } while (isEn != LocalizationService.IsEnglish);
 
             var items = targets.Select(t => new CleanTargetItem(
                 t.Key,
@@ -380,59 +418,57 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
         return null;
     }
 
-    private async void BtnLargeFoldersMode_Click(object sender, RoutedEventArgs e)
+    private void BtnLargeFoldersMode_Click(object sender, RoutedEventArgs e)
+    {
+        _analyzerViewMode = (_analyzerViewMode + 1) % 3;
+        _ = RefreshAnalyzerAsync();
+    }
+
+    private async Task RefreshAnalyzerAsync()
     {
         _analyzerCts?.Cancel();
-        _analyzerCts?.Dispose();
-        _analyzerCts = new CancellationTokenSource();
-        var ct = _analyzerCts.Token;
+        if (_stopped) return;
 
-        _analyzerViewMode = (_analyzerViewMode + 1) % 3;
         int expectedMode = _analyzerViewMode;
-        bool isEn = LocalizationService.IsEnglish;
+        bool analyzing = expectedMode != 0;
+        CleanTargetsList.Visibility = analyzing ? Visibility.Collapsed : Visibility.Visible;
+        LargeFoldersList.Visibility = analyzing ? Visibility.Visible : Visibility.Collapsed;
+        BtnSortTargets.Visibility = analyzing ? Visibility.Collapsed : Visibility.Visible;
+        LargeFoldersList.ItemsSource = null;
+        ApplyLanguage(LocalizationService.CurrentLanguage);
+        if (!analyzing) return;
 
-        if (expectedMode == 1)
+        using var cts = new CancellationTokenSource();
+        _analyzerCts = cts;
+        var ct = cts.Token;
+        string drive = _watchedDriveLetter;
+        try
         {
-            CleanTargetsList.Visibility = Visibility.Collapsed;
-            LargeFoldersList.Visibility = Visibility.Visible;
-            BtnSortTargets.Visibility = Visibility.Collapsed;
-            ApplyLanguage(LocalizationService.CurrentLanguage);
-
-            OnStatusChanged?.Invoke(isEn ? $"Scanning heavy folders on {_watchedDriveLetter}:..." : $"Анализ крупных папок на диске {_watchedDriveLetter}:...");
-            var heavy = await Task.Run(() => StorageService.ScanLargeDirectories(_watchedDriveLetter, 12), ct);
-            if (ct.IsCancellationRequested || _analyzerViewMode != expectedMode) return;
-            LargeFoldersList.ItemsSource = heavy;
-            OnStatusChanged?.Invoke(isEn
-                ? $"Found {heavy.Count} directories > 50 MB on {_watchedDriveLetter}:."
-                : $"Найдено каталогов > 50 МБ на диске {_watchedDriveLetter}:: {heavy.Count}.");
-        }
-        else if (expectedMode == 2)
-        {
-            CleanTargetsList.Visibility = Visibility.Collapsed;
-            LargeFoldersList.Visibility = Visibility.Visible;
-            BtnSortTargets.Visibility = Visibility.Collapsed;
-            ApplyLanguage(LocalizationService.CurrentLanguage);
-
-            OnStatusChanged?.Invoke(isEn ? $"Scanning largest files (>100 MB) and backups..." : $"Поиск крупных файлов (>100 МБ) и бэкапов...");
+            OnStatusChanged?.Invoke(LocalizationService.IsEnglish ? $"Analyzing drive {drive}:..." : $"Анализ диска {drive}:...");
             var items = await Task.Run(() =>
             {
-                var combined = new List<LargeDirectory>();
-                combined.AddRange(StorageService.FindBackupAndArchiveAudits());
-                combined.AddRange(StorageService.ScanLargestFiles(_watchedDriveLetter, 100L * 1024 * 1024, 15));
+                if (expectedMode == 1) return StorageService.ScanLargeDirectories(drive, 12, ct);
+                var combined = StorageService.FindBackupAndArchiveAudits(ct);
+                combined.AddRange(StorageService.ScanLargestFiles(drive, 100L * 1024 * 1024, 15, ct));
                 return combined.DistinctBy(x => x.Path).OrderByDescending(x => x.SizeBytes).ToList();
             }, ct);
-            if (ct.IsCancellationRequested || _analyzerViewMode != expectedMode) return;
+            ct.ThrowIfCancellationRequested();
             LargeFoldersList.ItemsSource = items;
-            OnStatusChanged?.Invoke(isEn
-                ? $"Found {items.Count} large files / backups."
-                : $"Найдено крупных файлов и бэкапов: {items.Count}.");
+            bool isEn = LocalizationService.IsEnglish;
+            OnStatusChanged?.Invoke(expectedMode == 1
+                ? (isEn ? $"Found {items.Count} directories > 50 MB on {drive}:." : $"Каталогов > 50 МБ на диске {drive}: найдено {items.Count}.")
+                : (isEn ? $"Found {items.Count} large files / backups." : $"Найдено крупных файлов и бэкапов: {items.Count}."));
         }
-        else
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex)
         {
-            LargeFoldersList.Visibility = Visibility.Collapsed;
-            CleanTargetsList.Visibility = Visibility.Visible;
-            BtnSortTargets.Visibility = Visibility.Visible;
-            ApplyLanguage(LocalizationService.CurrentLanguage);
+            Logger.Error("Disk analysis failed", ex);
+            if (!ct.IsCancellationRequested)
+                OnStatusChanged?.Invoke(LocalizationService.IsEnglish ? "Disk analysis failed." : "Ошибка анализа диска.");
+        }
+        finally
+        {
+            if (ReferenceEquals(_analyzerCts, cts)) _analyzerCts = null;
         }
     }
 
@@ -446,6 +482,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
         };
         PersistSettings();
         ApplyLanguage(LocalizationService.CurrentLanguage);
+        _ = ScanJunkAsync(showLog: false);
     }
 
     private async void TargetCardInfo_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
@@ -467,34 +504,49 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
         }
     }
 
+    private Task<bool?> QueryCompactOsAsync()
+    {
+        if (_compactQuery is { IsCompleted: false }) return _compactQuery;
+        var ct = _compactLifetime.Token;
+        return _compactQuery = Task.Run(() => StorageService.IsCompactOsEnabledAsync(ct));
+    }
+
     private async Task RefreshCompactOsButtonAsync()
     {
-        if (!CanExecuteCompactOs) return;
-
-        try
-        {
-            bool enabled = await StorageService.IsCompactOsEnabledAsync();
-            if (!CanExecuteCompactOs) return;
-            CompactOsState = enabled ? CompactOsState.On : CompactOsState.Off;
-        }
-        catch (Exception ex)
-        {
-            Logger.Debug($"RefreshCompactOsButtonAsync failed: {ex.Message}");
-        }
+        if (_stopped || !CanExecuteCompactOs) return;
+        var query = QueryCompactOsAsync();
+        bool? enabled = await query;
+        if (!_stopped && !_isCompactOsPromptOpen && CanExecuteCompactOs && ReferenceEquals(_compactQuery, query))
+            ApplyCompactOsState(enabled);
     }
+
+    private void ApplyCompactOsState(bool? enabled) => CompactOsState = enabled switch
+    {
+        true => CompactOsState.On,
+        false => CompactOsState.Off,
+        null => CompactOsState.Unknown
+    };
 
     private async void BtnCompactOs_Click(object sender, RoutedEventArgs e)
     {
-        if (!CanExecuteCompactOs || _isCompactOsPromptOpen || _isStorageOperationRunning) return;
+        if (_stopped || !CanExecuteCompactOs || _isCompactOsPromptOpen || _isStorageOperationRunning) return;
         _isCompactOsPromptOpen = true;
         bool enteredTransition = false;
 
-        bool isEn = LocalizationService.IsEnglish;
-        bool isAdmin = StorageService.IsAdministrator();
         try
         {
-            bool currentlyOn = await StorageService.IsCompactOsEnabledAsync();
-            bool wantEnable = !currentlyOn;
+            var ct = _compactLifetime.Token;
+            bool? currentlyOn = await QueryCompactOsAsync();
+            if (_stopped) return;
+            ApplyCompactOsState(currentlyOn);
+            bool isEn = LocalizationService.IsEnglish;
+            if (!currentlyOn.HasValue)
+            {
+                OnStatusChanged?.Invoke(isEn ? "Could not determine CompactOS state." : "Не удалось определить состояние CompactOS.");
+                return;
+            }
+            bool wantEnable = !currentlyOn.Value;
+            bool isAdmin = StorageService.IsAdministrator();
 
             if (ShowConfirmDialogAsync != null)
             {
@@ -515,6 +567,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
                     return;
             }
 
+            if (_stopped || _isStorageOperationRunning) return;
             enteredTransition = true;
             CompactOsState = wantEnable ? CompactOsState.Enabling : CompactOsState.Disabling;
             bool currentIsEn = LocalizationService.IsEnglish;
@@ -525,10 +578,10 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
             if (isAdmin)
             {
-                var (_, message) = await StorageService.SetCompactOsAsync(
+                var (_, message) = await Task.Run(() => StorageService.SetCompactOsAsync(
                     wantEnable,
                     currentIsEn,
-                    line => LogStorage($"[CompactOS] {line}"));
+                    line => LogStorage($"[CompactOS] {line}"), ct));
                 LogStorage($"[CompactOS] {message}");
                 OnStatusChanged?.Invoke(message);
             }
@@ -546,7 +599,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
                     DisabledTargetKeys: new List<string>(),
                     Action: wantEnable ? "compact_on" : "compact_off"
                 );
-                var run = await StorageService.ExecuteViaElevatedWorkerAsync(job, line => LogStorage(line));
+                var run = await StorageService.ExecuteViaElevatedWorkerAsync(job, LogStorage, ct);
                 string statusMsg = run.Result?.SummaryMessage ?? run.ErrorMessage ?? (LocalizationService.IsEnglish ? "CompactOS finished." : "CompactOS завершён.");
                 if (run.ElevationCancelled || !string.IsNullOrEmpty(run.ErrorMessage))
                 {
@@ -555,23 +608,23 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
                 OnStatusChanged?.Invoke(statusMsg);
             }
         }
+        catch (Exception ex)
+        {
+            Logger.Error("CompactOS operation failed", ex);
+            if (!_stopped) OnStatusChanged?.Invoke(ex.Message);
+        }
         finally
         {
-            _isCompactOsPromptOpen = false;
-            if (enteredTransition)
+            if (enteredTransition && !_stopped)
             {
-                bool enabled = false;
-                try
+                bool? enabled = await QueryCompactOsAsync();
+                if (!_stopped)
                 {
-                    enabled = await StorageService.IsCompactOsEnabledAsync();
+                    ApplyCompactOsState(enabled);
+                    OnCleanupCompleted?.Invoke();
                 }
-                catch (Exception ex)
-                {
-                    Logger.Debug($"CompactOS final state query failed: {ex.Message}");
-                }
-                CompactOsState = enabled ? CompactOsState.On : CompactOsState.Off;
-                OnCleanupCompleted?.Invoke();
             }
+            _isCompactOsPromptOpen = false;
         }
     }
 
@@ -584,11 +637,11 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
                 string explorer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
                 if (Directory.Exists(folder))
                 {
-                    Process.Start(new ProcessStartInfo(explorer, $"\"{Path.GetFullPath(folder)}\"") { UseShellExecute = true });
+                    using var process = Process.Start(new ProcessStartInfo(explorer, $"\"{Path.GetFullPath(folder)}\"") { UseShellExecute = true });
                 }
                 else if (File.Exists(folder))
                 {
-                    Process.Start(new ProcessStartInfo(explorer, $"/select,\"{Path.GetFullPath(folder)}\"") { UseShellExecute = true });
+                    using var process = Process.Start(new ProcessStartInfo(explorer, $"/select,\"{Path.GetFullPath(folder)}\"") { UseShellExecute = true });
                 }
             }
             catch (Exception ex) { Logger.Warn($"Open large folder error: {ex.Message}"); }
@@ -701,7 +754,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
     public async Task ScanJunkAsync(bool showLog = true, bool isManualClick = false, bool isBackground = false)
     {
-        if (_isStorageOperationRunning || _isScanningTargets) return;
+        if (_stopped || _isStorageOperationRunning || _isScanningTargets) return;
         if (isManualClick && _storageCooldownRemaining > 0) return;
 
         _isScanningTargets = true;
@@ -755,7 +808,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
     private async void BtnCleanSystem_Click(object sender, RoutedEventArgs e)
     {
-        if (_isStorageOperationRunning || _storageCooldownRemaining > 0) return;
+        if (_stopped || _isStorageOperationRunning || _isCompactOsPromptOpen || !CanExecuteCompactOs || _storageCooldownRemaining > 0) return;
 
         bool isEn = LocalizationService.IsEnglish;
         _isStorageOperationRunning = true;
@@ -794,6 +847,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
             OnStatusChanged?.Invoke(res.SummaryMessage);
 
+            if (ct.IsCancellationRequested) return;
             await PerformScanCoreAsync(showLog: false);
             OnCleanupCompleted?.Invoke();
 
@@ -810,9 +864,10 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
                 string cancelBtn = isEn ? "Skip" : "Нет";
 
                 bool grantAdmin = await ShowConfirmDialogAsync(title, msg, confirmBtn, cancelBtn, "IconShield");
+                if (ct.IsCancellationRequested) return;
                 if (grantAdmin)
                 {
-                    await RunElevatedWorkerCleanupAsync(isEn);
+                    await RunElevatedWorkerCleanupAsync(isEn, opts, ct);
                 }
                 else
                 {
@@ -832,7 +887,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
             _cleanupCts?.Dispose();
             _cleanupCts = null;
             _isStorageOperationRunning = false;
-            StartStorageCooldown(5);
+            if (!_stopped) StartStorageCooldown(5);
         }
     }
 
@@ -894,7 +949,7 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
         PersistSettings();
     }
 
-    private async Task RunElevatedWorkerCleanupAsync(bool isEn)
+    private async Task RunElevatedWorkerCleanupAsync(bool isEn, StorageCleanupOptions opts, CancellationToken ct)
     {
         LogStorage(isEn
             ? "[UAC] Starting elevated cleanup worker over ACL Named Pipe (window stays active)..."
@@ -903,19 +958,19 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
         var job = new ElevatedCleanupJob(
             IsEnglish: isEn,
-            CleanTemp: _settings.CleanTempFiles,
-            CleanSoftwareDistribution: _settings.CleanSoftwareDistribution,
-            CleanLogsAndReports: _settings.CleanLogsAndReports,
+            CleanTemp: opts.CleanTemp,
+            CleanSoftwareDistribution: opts.CleanSoftwareDistribution,
+            CleanLogsAndReports: opts.CleanLogsAndReports,
             CleanGpuShaderCache: false,
             CleanBrowserCache: false,
-            CleanDismComponentCleanup: _settings.CleanDismComponentCleanup,
-            CleanDismResetBase: _settings.CleanDismResetBase,
-            DisabledTargetKeys: new List<string>(_settings.DisabledCleanupTargets ?? new List<string>()),
+            CleanDismComponentCleanup: opts.CleanDismComponentCleanup,
+            CleanDismResetBase: opts.CleanDismResetBase,
+            DisabledTargetKeys: opts.DisabledTargetKeys?.ToList() ?? [],
             Action: "cleanup",
-            TempMinAgeDays: _settings.TempMinAgeDays
+            TempMinAgeDays: opts.TempMinAgeDays
         );
 
-        var run = await StorageService.ExecuteViaElevatedWorkerAsync(job, line => LogStorage(line), _cleanupCts?.Token ?? CancellationToken.None);
+        var run = await StorageService.ExecuteViaElevatedWorkerAsync(job, LogStorage, ct);
 
         if (run.Result != null && !string.IsNullOrWhiteSpace(run.Result.SummaryMessage))
         {
@@ -928,30 +983,31 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
             OnStatusChanged?.Invoke(run.ErrorMessage);
         }
 
+        if (ct.IsCancellationRequested) return;
         await PerformScanCoreAsync(showLog: false);
         OnCleanupCompleted?.Invoke();
     }
 
     private void StartStorageCooldown(int seconds)
     {
-        bool isEn = LocalizationService.IsEnglish;
         _storageCooldownRemaining = seconds;
 
         BtnCleanSystem.IsEnabled = false;
         BtnScanJunk.IsEnabled = false;
-        BtnCleanSystemText.Text = isEn ? $"Cooldown ({_storageCooldownRemaining}s)" : $"Ожидание ({_storageCooldownRemaining} сек)";
+        BtnCleanSystemText.Text = LocalizationService.IsEnglish ? $"Cooldown ({seconds}s)" : $"Ожидание ({seconds} сек)";
 
         _storageCooldownTimer?.Stop();
         _storageCooldownTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _storageCooldownTimer.Tick += (s, e) =>
         {
+            bool isEn = LocalizationService.IsEnglish;
             _storageCooldownRemaining--;
             if (_storageCooldownRemaining <= 0)
             {
                 _storageCooldownTimer.Stop();
                 BtnCleanSystem.IsEnabled = true;
                 BtnScanJunk.IsEnabled = true;
-                BtnCleanSystemText.Text = isEn ? "Clean System Cache" : "Очистить систему";
+                BtnCleanSystemText.Text = LocalizationService.Get("Storage.CleanBtn");
             }
             else
             {
@@ -963,32 +1019,36 @@ public partial class StorageView : UserControl, INotifyPropertyChanged
 
     public void LogStorage(string msg)
     {
-        Dispatcher.Invoke(() =>
+        if (!Dispatcher.CheckAccess())
         {
-            const int MaxLines = 300;
-            string time = DateTime.Now.ToString("HH:mm:ss");
-            string line = $"[{time}] {msg}";
+            if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(() => LogStorage(msg));
+            return;
+        }
+        if (_stopped) return;
 
-            if (string.IsNullOrWhiteSpace(StorageLogTextBox.Text))
+        const int MaxLines = 300;
+        string time = DateTime.Now.ToString("HH:mm:ss");
+        string line = $"[{time}] {msg}";
+
+        if (string.IsNullOrWhiteSpace(StorageLogTextBox.Text))
+        {
+            StorageLogTextBox.Text = line;
+        }
+        else
+        {
+            var lines = StorageLogTextBox.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            if (lines.Length >= MaxLines)
             {
-                StorageLogTextBox.Text = line;
+                StorageLogTextBox.Text = string.Join(Environment.NewLine, lines.Skip(lines.Length - MaxLines + 1)) + Environment.NewLine + line;
             }
             else
             {
-                var lines = StorageLogTextBox.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-                if (lines.Length >= MaxLines)
-                {
-                    StorageLogTextBox.Text = string.Join(Environment.NewLine, lines.Skip(lines.Length - MaxLines + 1)) + Environment.NewLine + line;
-                }
-                else
-                {
-                    StorageLogTextBox.AppendText(Environment.NewLine + line);
-                }
+                StorageLogTextBox.AppendText(Environment.NewLine + line);
             }
+        }
 
-            StorageLogScroll.ScrollToEnd();
-            StorageLogFooter.Text = LocalizationService.IsEnglish ? $"Last: {time}" : $"Последнее: {time}";
-        });
+        StorageLogScroll.ScrollToEnd();
+        StorageLogFooter.Text = LocalizationService.IsEnglish ? $"Last: {time}" : $"Последнее: {time}";
     }
 
     private void BtnClearStorageLog_Click(object sender, RoutedEventArgs e)

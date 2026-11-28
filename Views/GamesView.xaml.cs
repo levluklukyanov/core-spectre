@@ -16,6 +16,8 @@ public partial class GamesView : UserControl
     private string _gameDriveFilter = "ALL";
     private bool _includeLaunchers = false;
     private bool _isScanningGames = false;
+    private bool _hasScannedGames;
+    private string? _scanError;
     private List<InstalledGameInfo> _installedGames = new();
 
     public event Action? OnBoostPriorityRequested;
@@ -48,13 +50,7 @@ public partial class GamesView : UserControl
         InstalledGamesSubtitle.Text = LocalizationService.Get("Games.InstalledSub");
         BtnScanGamesText.Text = LocalizationService.Get("Games.ScanDrivesBtn");
         TxtNoActiveGames.Text = LocalizationService.Get("Games.NoActive");
-        TxtScanPlaceholder.Text = LocalizationService.Get("Games.NoScan");
-        if (_installedGames.Count == 0 && !_isScanningGames)
-        {
-            InstalledScanStatusText.Text = isEn
-                ? "Click 'Scan Drives' to discover games on your PC."
-                : "Нажмите «Сканировать диски» для поиска игр на ПК.";
-        }
+        UpdateScanStatus();
         InstalledGamesFooterInfo.Text = isEn
             ? "Scans Steam, Xbox, Epic, AppData (.minecraft, .tlauncher), and custom drive game folders."
             : "Сканирует библиотеки Steam, Xbox, Epic, AppData (.minecraft, .tlauncher) и папки Games на дисках.";
@@ -65,8 +61,14 @@ public partial class GamesView : UserControl
 
     public void UpdateDriveFilter(string filter)
     {
+        if (_gameDriveFilter == filter || _isScanningGames) return;
         _gameDriveFilter = filter;
+        _hasScannedGames = false;
+        _scanError = null;
+        _installedGames = new();
+        ListInstalledGames.ItemsSource = null;
         UpdateDriveFilterVisual();
+        UpdateScanStatus();
     }
 
     private void UpdateDriveFilterVisual()
@@ -113,42 +115,58 @@ public partial class GamesView : UserControl
         if (_isScanningGames) return;
         _isScanningGames = true;
         BtnScanGames.IsEnabled = false;
-        bool isEn = LocalizationService.IsEnglish;
-
-        InstalledScanStatusText.Text = isEn 
-            ? $"Scanning storage ({_gameDriveFilter})..." 
-            : $"Сканирование накопителей ({_gameDriveFilter})...";
-        InstalledScanCountText.Text = "";
+        BtnGameDriveFilter.IsEnabled = false;
+        BtnToggleLaunchers.IsEnabled = false;
+        _scanError = null;
+        UpdateScanStatus();
 
         try
         {
-            _installedGames = await GameBoostService.ScanInstalledGamesAsync(_gameDriveFilter, !isEn, _includeLaunchers);
+            _installedGames = await GameBoostService.ScanInstalledGamesAsync(_gameDriveFilter, LocalizationService.IsRussian, _includeLaunchers);
             ListInstalledGames.ItemsSource = _installedGames;
-            TxtScanPlaceholder.Visibility = _installedGames.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-
-            long totalBytes = _installedGames.Sum(g => g.SizeBytes);
-            string szFormatted = StorageService.FormatBytes(totalBytes);
-
-            InstalledScanCountText.Text = isEn 
-                ? $"{_installedGames.Count} games ({szFormatted})" 
-                : $"{_installedGames.Count} игр ({szFormatted})";
-            InstalledScanStatusText.Text = isEn 
-                ? $"Scan completed: {_installedGames.Count} game directories found." 
-                : $"Сканирование завершено: найдено каталогов: {_installedGames.Count}.";
-            OnStatusChanged?.Invoke(isEn 
+            _hasScannedGames = true;
+            OnStatusChanged?.Invoke(LocalizationService.IsEnglish
                 ? $"Game library scan complete: {_installedGames.Count} items." 
                 : $"Сканирование каталога игр завершено: найдено {_installedGames.Count}.");
         }
         catch (Exception ex)
         {
             Logger.Error("Game scan failed", ex);
-            InstalledScanStatusText.Text = isEn ? $"Scan failed: {ex.Message}" : $"Ошибка сканирования: {ex.Message}";
+            _scanError = ex.Message;
         }
         finally
         {
             _isScanningGames = false;
             BtnScanGames.IsEnabled = true;
+            BtnGameDriveFilter.IsEnabled = true;
+            BtnToggleLaunchers.IsEnabled = true;
+            UpdateScanStatus();
         }
+    }
+
+    private void UpdateScanStatus()
+    {
+        bool isEn = LocalizationService.IsEnglish;
+        InstalledScanCountText.Text = "";
+        TxtScanPlaceholder.Visibility = !_isScanningGames && _scanError == null && _installedGames.Count == 0
+            ? Visibility.Visible : Visibility.Collapsed;
+        TxtScanPlaceholder.Text = _hasScannedGames
+            ? (isEn ? "No games found on the selected drives." : "На выбранных дисках игры не найдены.")
+            : LocalizationService.Get("Games.NoScan");
+
+        if (_isScanningGames)
+            InstalledScanStatusText.Text = isEn ? $"Scanning storage ({_gameDriveFilter})..." : $"Сканирование накопителей ({_gameDriveFilter})...";
+        else if (_scanError != null)
+            InstalledScanStatusText.Text = isEn ? $"Scan failed: {_scanError}" : $"Ошибка сканирования: {_scanError}";
+        else if (_hasScannedGames)
+        {
+            int count = _installedGames.Count;
+            string size = StorageService.FormatBytes(_installedGames.Sum(g => g.SizeBytes));
+            InstalledScanStatusText.Text = isEn ? $"Scan completed: {count} game directories found." : $"Сканирование завершено: найдено каталогов: {count}.";
+            InstalledScanCountText.Text = isEn ? $"{count} games ({size})" : $"{count} игр ({size})";
+        }
+        else
+            InstalledScanStatusText.Text = isEn ? "Click 'Scan Drives' to discover games on your PC." : "Нажмите «Сканировать диски» для поиска игр на ПК.";
     }
 
     private async void BtnScanGames_Click(object sender, RoutedEventArgs e)
@@ -201,7 +219,7 @@ public partial class GamesView : UserControl
             {
                 string safePath = Path.GetFullPath(path);
                 string explorerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
-                Process.Start(new ProcessStartInfo(explorerPath, $"\"{safePath}\"") { UseShellExecute = true });
+                using var process = Process.Start(new ProcessStartInfo(explorerPath, $"\"{Path.TrimEndingDirectorySeparator(safePath)}\"") { UseShellExecute = true });
             }
             catch (Exception ex)
             {

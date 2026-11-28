@@ -43,9 +43,15 @@
 
                     <!-- Clickable Metric Zone -->
                     <StackPanel x:Name="MetricCpuAction" Cursor="Hand" MouseLeftButtonDown="CpuMetric_Click" ToolTip="Switch to CPU Optimization tab" Background="Transparent">
-                        <Grid Margin="0,10,0,6" ClipToBounds="True">
-                            <TextBlock x:Name="DashCpuVal" Text="0%" FontSize="36" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
-                            <Polyline x:Name="CpuSparkline" Stroke="{DynamicResource BrushTextSecondary}" StrokeThickness="1.5" Width="104" Height="28" ClipToBounds="True" HorizontalAlignment="Right" VerticalAlignment="Center" Opacity="0.85"/>
+                         <Grid Margin="0,10,0,6" ClipToBounds="True">
+                             <Grid.ColumnDefinitions>
+                                 <ColumnDefinition Width="Auto"/>
+                                 <ColumnDefinition Width="*"/>
+                             </Grid.ColumnDefinitions>
+                             <TextBlock x:Name="DashCpuVal" Text="0%" FontSize="36" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
+                             <Viewbox Grid.Column="1" Stretch="Fill" StretchDirection="DownOnly" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="6,0,0,0">
+                                 <Polyline x:Name="CpuSparkline" Stroke="{DynamicResource BrushTextSecondary}" StrokeThickness="1.5" Width="104" Height="28" ClipToBounds="True" Opacity="0.85"/>
+                             </Viewbox>
                         </Grid>
                         <ProgressBar x:Name="DashCpuProgress" Style="{StaticResource ProgressBarMonochrome}" Value="0" Maximum="100" Margin="0,4,0,10"/>
                     </StackPanel>
@@ -69,9 +75,15 @@
 
                     <!-- Clickable Metric Zone -->
                     <StackPanel x:Name="MetricRamAction" Cursor="Hand" MouseLeftButtonDown="RamMetric_Click" ToolTip="Switch to Memory Purge tab" Background="Transparent">
-                        <Grid Margin="0,10,0,6" ClipToBounds="True">
-                            <TextBlock x:Name="DashRamVal" Text="0%" FontSize="36" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
-                            <Polyline x:Name="RamSparkline" Stroke="{DynamicResource BrushTextSecondary}" StrokeThickness="1.5" Width="104" Height="28" ClipToBounds="True" HorizontalAlignment="Right" VerticalAlignment="Center" Opacity="0.85"/>
+                         <Grid Margin="0,10,0,6" ClipToBounds="True">
+                             <Grid.ColumnDefinitions>
+                                 <ColumnDefinition Width="Auto"/>
+                                 <ColumnDefinition Width="*"/>
+                             </Grid.ColumnDefinitions>
+                             <TextBlock x:Name="DashRamVal" Text="0%" FontSize="36" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
+                             <Viewbox Grid.Column="1" Stretch="Fill" StretchDirection="DownOnly" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="6,0,0,0">
+                                 <Polyline x:Name="RamSparkline" Stroke="{DynamicResource BrushTextSecondary}" StrokeThickness="1.5" Width="104" Height="28" ClipToBounds="True" Opacity="0.85"/>
+                             </Viewbox>
                         </Grid>
                         <ProgressBar x:Name="DashRamProgress" Style="{StaticResource ProgressBarMonochrome}" Value="0" Maximum="100" Margin="0,4,0,10"/>
                     </StackPanel>

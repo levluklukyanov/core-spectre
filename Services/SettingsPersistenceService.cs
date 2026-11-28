@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -134,7 +133,8 @@ public static class SettingsPersistenceService
             return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "user_settings.json");
         }
 
-        string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData, Environment.SpecialFolderOption.DoNotVerify);
+        if (!Path.IsPathFullyQualified(appData)) throw new IOException("Windows did not provide an AppData path.");
         string coreSpectreDir = Path.Combine(appData, "CoreSpectre");
         return Path.Combine(coreSpectreDir, "user_settings.json");
     }
@@ -183,6 +183,11 @@ public static class SettingsPersistenceService
         model.DisabledCleanupTargets ??= new List<string>();
         model.ProcessWhitelist ??= new List<string>();
         model.CustomGameProcesses ??= new List<string>();
+        model.ActiveTabs.RemoveAll(string.IsNullOrWhiteSpace);
+        model.VaultTabs.RemoveAll(string.IsNullOrWhiteSpace);
+        model.DisabledCleanupTargets.RemoveAll(string.IsNullOrWhiteSpace);
+        model.ProcessWhitelist.RemoveAll(string.IsNullOrWhiteSpace);
+        model.CustomGameProcesses.RemoveAll(string.IsNullOrWhiteSpace);
 
         if (!model.ActiveTabs.Contains("settings"))
         {
@@ -236,9 +241,7 @@ public static class SettingsPersistenceService
                 }
 
                 string json = JsonSerializer.Serialize(model, JsonOptions);
-                string tempPath = path + $".tmp.{Guid.NewGuid():N}";
-                File.WriteAllText(tempPath, json, Encoding.UTF8);
-                File.Move(tempPath, path, overwrite: true);
+                WriteAtomic(path, json);
 
                 LastError = null;
                 return true;
@@ -277,9 +280,7 @@ public static class SettingsPersistenceService
             }
 
             string outJson = JsonSerializer.Serialize(envelope, JsonOptions);
-            string tempPath = filePath + $".tmp.{Guid.NewGuid():N}";
-            File.WriteAllText(tempPath, outJson, Encoding.UTF8);
-            File.Move(tempPath, filePath, overwrite: true);
+            WriteAtomic(filePath, outJson);
 
             return (true, isEn
                 ? $"Backup saved to {Path.GetFileName(filePath)}."
@@ -289,6 +290,22 @@ public static class SettingsPersistenceService
         {
             Logger.Error("Failed to export .csb backup", ex);
             return (false, isEn ? $"Backup export failed: {ex.Message}" : $"Ошибка экспорта .csb: {ex.Message}");
+        }
+    }
+
+    private static void WriteAtomic(string path, string json)
+    {
+        string tempPath = path + $".tmp.{Guid.NewGuid():N}";
+        try
+        {
+            File.WriteAllText(tempPath, json, Encoding.UTF8);
+            File.Move(tempPath, path, overwrite: true);
+        }
+        catch
+        {
+            try { File.Delete(tempPath); }
+            catch (Exception ex) { Logger.Debug($"Could not remove temporary settings file: {ex.Message}"); }
+            throw;
         }
     }
 
@@ -311,18 +328,13 @@ public static class SettingsPersistenceService
                 return (false, null, isEn ? "Invalid .csb backup format." : "Неверный формат файла резервной копии .csb.");
             }
 
-            string expectedChecksum;
-            using (var doc = JsonDocument.Parse(raw))
-            {
-                if (doc.RootElement.TryGetProperty("Settings", out var settingsElement))
-                {
-                    expectedChecksum = ComputeSha256Hex(JsonSerializer.Serialize(settingsElement, CanonicalJsonOptions));
-                }
-                else
-                {
-                    expectedChecksum = ComputeSha256Hex(JsonSerializer.Serialize(envelope.Settings, CanonicalJsonOptions));
-                }
-            }
+            using var doc = JsonDocument.Parse(raw);
+            var settingsProperties = doc.RootElement.EnumerateObject()
+                .Where(p => p.Name.Equals("Settings", StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (settingsProperties.Length != 1)
+                return (false, null, isEn ? "Invalid .csb backup format." : "Неверный формат файла резервной копии .csb.");
+
+            string expectedChecksum = ComputeSha256Hex(JsonSerializer.Serialize(settingsProperties[0].Value, CanonicalJsonOptions));
             if (!string.Equals(expectedChecksum, envelope.Checksum, StringComparison.OrdinalIgnoreCase))
             {
                 return (false, null, isEn
@@ -358,7 +370,7 @@ public static class SettingsPersistenceService
     {
         try
         {
-            string? exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+            string? exePath = Environment.ProcessPath;
             if (string.IsNullOrWhiteSpace(exePath) ||
                 !File.Exists(exePath) ||
                 !exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ||
@@ -423,13 +435,18 @@ public static class SettingsPersistenceService
     {
         try
         {
-            using var runKey = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", writable: true);
-            if (runKey == null) return false;
+            const string runKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+            using var runKey = enable
+                ? Registry.CurrentUser.CreateSubKey(runKeyPath, writable: true)
+                : Registry.CurrentUser.OpenSubKey(runKeyPath, writable: true);
+            if (runKey == null) return !enable;
 
             if (enable)
             {
-                string? exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+                string? exePath = Environment.ProcessPath;
                 if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath)) return false;
+                using var approved = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", writable: true);
+                approved?.DeleteValue("CoreSpectre", throwOnMissingValue: false);
                 runKey.SetValue("CoreSpectre", $"\"{exePath}\" --minimized", RegistryValueKind.String);
             }
             else

@@ -54,8 +54,8 @@ public partial class App : Application
             using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.Out, PipeOptions.Asynchronous);
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             await client.ConnectAsync(cts.Token);
-            using var writer = new StreamWriter(client, new UTF8Encoding(false)) { AutoFlush = true };
-            await writer.WriteLineAsync(string.IsNullOrEmpty(csbPath) ? "ACTIVATE" : $"OPEN:{csbPath}");
+            string message = string.IsNullOrEmpty(csbPath) ? "ACTIVATE\n" : $"OPEN:{csbPath}\n";
+            await client.WriteAsync(Encoding.UTF8.GetBytes(message), cts.Token);
         }
         catch (Exception ex)
         {
@@ -111,7 +111,7 @@ public partial class App : Application
                             {
                                 mw.HandleExternalCsbOpen(csbPath);
                             }
-                        });
+                        }, System.Windows.Threading.DispatcherPriority.Normal, ct);
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -125,7 +125,8 @@ public partial class App : Application
                 catch (Exception ex)
                 {
                     Logger.Debug($"Activation pipe loop warning: {ex.Message}");
-                    await Task.Delay(250, ct);
+                    try { await Task.Delay(250, ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                 }
             }
         }, ct);
@@ -134,17 +135,31 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        try { await StartCoreSpectreAsync(e.Args); }
+        catch (Exception ex)
+        {
+            Logger.LogCrash("CoreSpectre startup failed", ex);
+            Shutdown(1);
+        }
+    }
 
-        int workerIdx = Array.FindIndex(e.Args, a => string.Equals(a, "--elevated-worker", StringComparison.OrdinalIgnoreCase));
-        if (workerIdx >= 0 && workerIdx + 1 < e.Args.Length)
+    private async Task StartCoreSpectreAsync(string[] args)
+    {
+        int workerIdx = Array.FindIndex(args, a => string.Equals(a, "--elevated-worker", StringComparison.OrdinalIgnoreCase));
+        if (workerIdx >= 0)
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
-            string pipeName = e.Args[workerIdx + 1];
+            if (workerIdx + 1 >= args.Length || !StorageService.IsValidPipeName(args[workerIdx + 1]))
+            {
+                Shutdown(2);
+                return;
+            }
+            string pipeName = args[workerIdx + 1];
             int code = 0;
             try
             {
                 Logger.Info($"CoreSpectre elevated cleanup worker started for pipe: {pipeName}");
-                code = await StorageService.RunElevatedWorkerAsync(pipeName);
+                code = await Task.Run(() => StorageService.RunElevatedWorkerAsync(pipeName));
             }
             catch (Exception ex)
             {
@@ -155,8 +170,8 @@ public partial class App : Application
             return;
         }
 
-        string? startupCsbPath = ExtractCsbArg(e.Args);
-        bool startMinimized = e.Args.Any(a => string.Equals(a, "--minimized", StringComparison.OrdinalIgnoreCase));
+        string? startupCsbPath = ExtractCsbArg(args);
+        bool startMinimized = args.Any(a => string.Equals(a, "--minimized", StringComparison.OrdinalIgnoreCase));
         string scope = GetUserScopeToken();
         string mutexName = $"Local\\CoreSpectre_SingleInstance_{scope}";
         string activationPipeName = $"CoreSpectre_Activation_{scope}";
@@ -168,7 +183,6 @@ public partial class App : Application
             _instanceMutex.Dispose();
             _instanceMutex = null;
             Shutdown(0);
-            Environment.Exit(0);
             return;
         }
 
@@ -197,41 +211,11 @@ public partial class App : Application
             else
             {
                 Logger.LogCrash("Fatal Dispatcher Unhandled Exception", ex);
-                string details = ex.InnerException != null 
-                    ? $"{ex.Message}\n\nDetails: {ex.InnerException.Message}" 
-                    : ex.Message;
-
-                try
-                {
-                    MessageBox.Show(
-                        $"A critical error occurred in CoreSpectre.\n\n" +
-                        $"Error: {details}\n\n" +
-                        $"Crash log saved to:\n{Logger.CrashLogFilePath}\n\n" +
-                        $"The application will now shut down to prevent state corruption.",
-                        "CoreSpectre - Critical Error",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Error);
-                }
-                catch (Exception dialogEx)
-                {
-                    Logger.Error("Failed to display crash dialog", dialogEx);
-                }
-
                 args.Handled = false;
             }
         };
 
-        AppDomain.CurrentDomain.UnhandledException += (s, args) =>
-        {
-            if (args.ExceptionObject is Exception ex)
-            {
-                Logger.LogCrash("Unhandled AppDomain Exception", ex);
-            }
-            else
-            {
-                Logger.LogCrash($"Unhandled AppDomain Object: {args.ExceptionObject}");
-            }
-        };
+        AppDomain.CurrentDomain.UnhandledException += HandleUnhandledException;
 
         _pipeCts = new CancellationTokenSource();
         StartActivationPipeListener(activationPipeName, _pipeCts.Token);
@@ -240,12 +224,18 @@ public partial class App : Application
         MainWindow = mainWindow;
         if (!string.IsNullOrEmpty(startupCsbPath))
         {
-            mainWindow.Loaded += (_, _) => mainWindow.HandleExternalCsbOpen(startupCsbPath);
+            void OpenStartupBackup(object sender, RoutedEventArgs e)
+            {
+                mainWindow.Loaded -= OpenStartupBackup;
+                mainWindow.HandleExternalCsbOpen(startupCsbPath);
+            }
+            mainWindow.Loaded += OpenStartupBackup;
         }
         if (startMinimized && string.IsNullOrEmpty(startupCsbPath))
         {
             var helper = new System.Windows.Interop.WindowInteropHelper(mainWindow);
             helper.EnsureHandle();
+            if (!mainWindow.CanRestoreFromTray) mainWindow.Show();
         }
         else
         {
@@ -253,8 +243,15 @@ public partial class App : Application
         }
     }
 
+    private static void HandleUnhandledException(object sender, UnhandledExceptionEventArgs args)
+    {
+        if (args.ExceptionObject is Exception ex) Logger.LogCrash("Unhandled AppDomain Exception", ex);
+        else Logger.LogCrash($"Unhandled AppDomain Object: {args.ExceptionObject}");
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
+        AppDomain.CurrentDomain.UnhandledException -= HandleUnhandledException;
         _pipeCts?.Cancel();
         _pipeCts?.Dispose();
         try { _instanceMutex?.ReleaseMutex(); } catch { }

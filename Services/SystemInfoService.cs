@@ -210,29 +210,35 @@ public static class SystemInfoService
             }
             catch (Exception ex) { Logger.Debug("SystemInfoService.cs: " + ex.Message); }
 
-            foreach (var drive in DriveInfo.GetDrives().Where(d => d.IsReady))
+            foreach (var drive in DriveInfo.GetDrives())
             {
-                long total = drive.TotalSize;
-                long free = drive.AvailableFreeSpace;
-                double usedPct = total > 0 ? (double)(total - free) / total * 100.0 : 0;
-                string letter = drive.Name.TrimEnd('\\');
-                string media = mediaTypes.TryGetValue(letter, out var mt) ? mt : "—";
+                try
+                {
+                    if (!drive.IsReady) continue;
+                    long total = drive.TotalSize;
+                    long free = drive.AvailableFreeSpace;
+                    double usedPct = total > 0 ? (double)(total - free) / total * 100.0 : 0;
+                    string letter = drive.Name.TrimEnd('\\');
+                    string media = mediaTypes.TryGetValue(letter, out var mt) ? mt : "—";
 
-                string defaultLabel = isEn ? "Local Disk" : "Локальный диск";
-                string label = string.IsNullOrWhiteSpace(drive.VolumeLabel) ? defaultLabel : drive.VolumeLabel;
+                    string defaultLabel = isEn ? "Local Disk" : "Локальный диск";
+                    string label = string.IsNullOrWhiteSpace(drive.VolumeLabel) ? defaultLabel : drive.VolumeLabel;
 
-                list.Add(new DiskDetail(
-                    DriveLetter: letter,
-                    Label: label,
-                    TotalBytes: total,
-                    FreeBytes: free,
-                    FileSystem: drive.DriveFormat,
-                    DriveType: drive.DriveType.ToString(),
-                    MediaType: media,
-                    FormattedTotal: StorageService.FormatBytes(total),
-                    FormattedFree: StorageService.FormatBytes(free),
-                    UsedPercent: Math.Round(usedPct, 1)
-                ));
+                    list.Add(new DiskDetail(
+                        DriveLetter: letter,
+                        Label: label,
+                        TotalBytes: total,
+                        FreeBytes: free,
+                        FileSystem: drive.DriveFormat,
+                        DriveType: drive.DriveType.ToString(),
+                        MediaType: media,
+                        FormattedTotal: StorageService.FormatBytes(total),
+                        FormattedFree: StorageService.FormatBytes(free),
+                        UsedPercent: Math.Round(usedPct, 1)
+                    ));
+                }
+                catch (IOException ex) { Logger.Debug($"Disk {drive.Name} is unavailable: {ex.Message}"); }
+                catch (UnauthorizedAccessException ex) { Logger.Debug($"Disk {drive.Name} is unavailable: {ex.Message}"); }
             }
         }
         catch (Exception ex) { Logger.Debug("SystemInfoService.cs: " + ex.Message); }

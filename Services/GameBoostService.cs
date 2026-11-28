@@ -34,7 +34,8 @@ public record GameBoostResult(
 
 public static class GameBoostService
 {
-    private static readonly ConcurrentDictionary<int, ProcessPriorityClass> _originalPriorities = new();
+    private static readonly object _priorityLock = new();
+    private static readonly Dictionary<int, (DateTime Started, ProcessPriorityClass Priority)> _originalPriorities = new();
     private static readonly ConcurrentDictionary<int, byte> _accessDeniedLogged = new();
 
     public static string? CheckMinecraftXmxWarning(long totalRamBytes, bool isEn)
@@ -286,10 +287,19 @@ public static class GameBoostService
             }
         }
 
-        // Purge exited PIDs from cached dictionaries
-        foreach (var pid in _originalPriorities.Keys)
+        lock (_priorityLock)
         {
-            if (!activePids.Contains(pid)) _originalPriorities.TryRemove(pid, out _);
+            foreach (var (pid, original) in _originalPriorities.ToArray())
+            {
+                try
+                {
+                    using var proc = Process.GetProcessById(pid);
+                    if (proc.StartTime != original.Started || proc.HasExited) _originalPriorities.Remove(pid);
+                }
+                catch (ArgumentException) { _originalPriorities.Remove(pid); }
+                catch (InvalidOperationException) { _originalPriorities.Remove(pid); }
+                catch (System.ComponentModel.Win32Exception) { }
+            }
         }
         foreach (var pid in _accessDeniedLogged.Keys)
         {
@@ -302,8 +312,10 @@ public static class GameBoostService
     public static GameBoostResult BoostGames(
         bool isRu = false,
         IReadOnlyCollection<string>? customGameProcesses = null,
-        IReadOnlyCollection<string>? excludedProcesses = null)
+        IReadOnlyCollection<string>? excludedProcesses = null,
+        CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested) return new GameBoostResult(0, 0, []);
         var processes = Process.GetProcesses();
         int boosted = 0;
         int alreadyHigh = 0;
@@ -315,7 +327,7 @@ public static class GameBoostService
             int safePid = proc.Id;
             try
             {
-                if (safePid <= 4) continue;
+                if (safePid <= 4 || safePid == Environment.ProcessId || cancellationToken.IsCancellationRequested) continue;
 
                 string procName = proc.ProcessName;
                 safeProcName = procName;
@@ -326,16 +338,22 @@ public static class GameBoostService
                 if (isGame)
                 {
                     affected.Add(displayName);
-                    var currentPriority = proc.PriorityClass;
-                    if (currentPriority != ProcessPriorityClass.High && currentPriority != ProcessPriorityClass.RealTime)
+                    lock (_priorityLock)
                     {
-                        _originalPriorities.TryAdd(proc.Id, currentPriority);
+                        if (cancellationToken.IsCancellationRequested) continue;
+                        _ = proc.SafeHandle; // Keep the same process object for the identity check and priority change.
+                        var started = proc.StartTime;
+                        var currentPriority = proc.PriorityClass;
+                        if (currentPriority is ProcessPriorityClass.High or ProcessPriorityClass.RealTime)
+                        {
+                            alreadyHigh++;
+                            continue;
+                        }
+
                         proc.PriorityClass = ProcessPriorityClass.High;
+                        if (!_originalPriorities.TryGetValue(proc.Id, out var existing) || existing.Started != started)
+                            _originalPriorities[proc.Id] = (started, currentPriority);
                         boosted++;
-                    }
-                    else
-                    {
-                        alreadyHigh++;
                     }
                 }
             }
@@ -355,24 +373,28 @@ public static class GameBoostService
         return new GameBoostResult(boosted, alreadyHigh, affected.ToList());
     }
 
-    public static int RestoreAllGamePriorities()
+    public static int RestoreAllGamePriorities(CancellationToken cancellationToken = default)
     {
         int restored = 0;
-        foreach (var kvp in _originalPriorities.ToArray())
+        lock (_priorityLock)
         {
-            try
+            if (cancellationToken.IsCancellationRequested) return 0;
+            foreach (var (pid, original) in _originalPriorities.ToArray())
             {
-                using var proc = Process.GetProcessById(kvp.Key);
-                if (proc.PriorityClass == ProcessPriorityClass.High)
+                try
                 {
-                    proc.PriorityClass = kvp.Value;
-                    restored++;
+                    using var proc = Process.GetProcessById(pid);
+                    _ = proc.SafeHandle;
+                    if (proc.StartTime == original.Started && proc.PriorityClass == ProcessPriorityClass.High)
+                    {
+                        proc.PriorityClass = original.Priority;
+                        restored++;
+                    }
+                    _originalPriorities.Remove(pid);
                 }
-            }
-            catch { }
-            finally
-            {
-                _originalPriorities.TryRemove(kvp.Key, out _);
+                catch (ArgumentException) { _originalPriorities.Remove(pid); }
+                catch (InvalidOperationException) { _originalPriorities.Remove(pid); }
+                catch (System.ComponentModel.Win32Exception ex) { Logger.Debug($"Game priority restore failed for PID {pid}: {ex.Message}"); }
             }
         }
         return restored;
@@ -403,6 +425,21 @@ public static class GameBoostService
             var list = new List<InstalledGameInfo>();
             var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            bool AllowsDirectory(string? path) => path != null && (driveFilter is null or "" or "ALL" ||
+                string.Equals(Path.GetPathRoot(path)?.TrimEnd('\\', ':'), driveFilter, StringComparison.OrdinalIgnoreCase));
+
+            void CheckDir(string path, string name, string category)
+            {
+                if (!includeLaunchers && IsMinecraftLauncher(name, path, category)) return;
+                string? resolved = StorageService.ResolveDirectoryPath(path);
+                if (resolved == null || !AllowsDirectory(resolved)) return;
+                if (!includeLaunchers && IsMinecraftLauncher(name, resolved, category)) return;
+                if (!seenPaths.Add(resolved)) return;
+                string letter = Path.GetPathRoot(resolved)?.TrimEnd('\\', ':') ?? "";
+                long size = GetFolderSizeFast(resolved);
+                list.Add(new InstalledGameInfo(name, resolved, category, letter, size, StorageService.FormatBytes(size)));
+            }
+
             var drives = DriveInfo.GetDrives()
                 .Where(d => d.IsReady && (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable))
                 .ToList();
@@ -416,17 +453,11 @@ public static class GameBoostService
             try
             {
                 string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-                string appDrive = Path.GetPathRoot(appData)?.TrimEnd('\\', ':') ?? "C";
-                CheckDir(list, seenPaths, Path.Combine(appData, ".minecraft"), isRu ? "Майнкрафт (AppData)" : "Minecraft (AppData)", "Minecraft", appDrive, includeLaunchers);
+                CheckDir(Path.Combine(appData, ".minecraft"), isRu ? "Майнкрафт (AppData)" : "Minecraft (AppData)", "Minecraft");
                 if (includeLaunchers)
                 {
-                    CheckDir(list, seenPaths, Path.Combine(appData, ".tlauncher"), "TLauncher (AppData)", "Launcher", appDrive, includeLaunchers);
-                    CheckDir(list, seenPaths, Path.Combine(appData, ".vimeworld"), "VimeWorld (AppData)", "Launcher", appDrive, includeLaunchers);
-                }
-
-                if (!string.IsNullOrEmpty(driveFilter) && driveFilter != "ALL")
-                {
-                    list.RemoveAll(g => !g.DriveLetter.Equals(driveFilter, StringComparison.OrdinalIgnoreCase));
+                    CheckDir(Path.Combine(appData, ".tlauncher"), "TLauncher (AppData)", "Launcher");
+                    CheckDir(Path.Combine(appData, ".vimeworld"), "VimeWorld (AppData)", "Launcher");
                 }
             }
             catch (Exception ex) { Logger.Debug("GameBoostService.cs: " + ex.Message); }
@@ -435,14 +466,12 @@ public static class GameBoostService
             foreach (var drive in drives)
             {
                 string root = drive.RootDirectory.FullName;
-                string letter = drive.Name.TrimEnd('\\', ':');
-
-                CheckDir(list, seenPaths, Path.Combine(root, ".minecraft"), isRu ? "Майнкрафт" : "Minecraft", "Minecraft", letter, includeLaunchers);
-                CheckDir(list, seenPaths, Path.Combine(root, ".tlauncher"), "TLauncher", "Launcher", letter, includeLaunchers);
-                CheckDir(list, seenPaths, Path.Combine(root, ".vimeworld"), "VimeWorld", "Launcher", letter, includeLaunchers);
+                CheckDir(Path.Combine(root, ".minecraft"), isRu ? "Майнкрафт" : "Minecraft", "Minecraft");
+                CheckDir(Path.Combine(root, ".tlauncher"), "TLauncher", "Launcher");
+                CheckDir(Path.Combine(root, ".vimeworld"), "VimeWorld", "Launcher");
 
                 string gamesDir = Path.Combine(root, "Games");
-                if (Directory.Exists(gamesDir))
+                if (AllowsDirectory(StorageService.ResolveDirectoryPath(gamesDir)))
                 {
                     try
                     {
@@ -460,7 +489,7 @@ public static class GameBoostService
                             if (name.Equals("minecraft", StringComparison.OrdinalIgnoreCase))
                                 name = isRu ? "Майнкрафт" : "Minecraft";
 
-                            CheckDir(list, seenPaths, sub, name, cat, letter, includeLaunchers);
+                            CheckDir(sub, name, cat);
                         }
                     }
                     catch (Exception ex) { Logger.Debug("GameBoostService.cs: " + ex.Message); }
@@ -477,7 +506,7 @@ public static class GameBoostService
                 foreach (var sp in steamPaths)
                 {
                     string vdf = Path.Combine(Directory.GetParent(sp)?.FullName ?? "", "libraryfolders.vdf");
-                    if (File.Exists(vdf))
+                    if (AllowsDirectory(StorageService.ResolveDirectoryPath(Path.GetDirectoryName(vdf) ?? "")) && File.Exists(vdf))
                     {
                         try
                         {
@@ -494,19 +523,13 @@ public static class GameBoostService
 
                 foreach (var sp in extraSteamLibs)
                 {
-                    if (Directory.Exists(sp))
+                    if (AllowsDirectory(StorageService.ResolveDirectoryPath(sp)))
                     {
                         try
                         {
                             foreach (var sub in Directory.EnumerateDirectories(sp))
                             {
-                                string libLetter = Path.GetPathRoot(sub)?.TrimEnd('\\', ':') ?? letter;
-                                if (!string.IsNullOrEmpty(driveFilter) && driveFilter != "ALL" &&
-                                    !libLetter.Equals(driveFilter, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    continue;
-                                }
-                                CheckDir(list, seenPaths, sub, Path.GetFileName(sub), "Steam", libLetter, includeLaunchers);
+                                CheckDir(sub, Path.GetFileName(sub), "Steam");
                             }
                         }
                         catch (Exception ex) { Logger.Debug("GameBoostService.cs: " + ex.Message); }
@@ -514,26 +537,26 @@ public static class GameBoostService
                 }
 
                 string xboxDir = Path.Combine(root, "XboxGames");
-                if (Directory.Exists(xboxDir))
+                if (AllowsDirectory(StorageService.ResolveDirectoryPath(xboxDir)))
                 {
                     try
                     {
                         foreach (var sub in Directory.EnumerateDirectories(xboxDir))
                         {
-                            CheckDir(list, seenPaths, sub, Path.GetFileName(sub), "Xbox", letter, includeLaunchers);
+                            CheckDir(sub, Path.GetFileName(sub), "Xbox");
                         }
                     }
                     catch (Exception ex) { Logger.Debug("GameBoostService.cs: " + ex.Message); }
                 }
 
                 string epicDir = Path.Combine(root, "Program Files", "Epic Games");
-                if (Directory.Exists(epicDir))
+                if (AllowsDirectory(StorageService.ResolveDirectoryPath(epicDir)))
                 {
                     try
                     {
                         foreach (var sub in Directory.EnumerateDirectories(epicDir))
                         {
-                            CheckDir(list, seenPaths, sub, Path.GetFileName(sub), "Epic Games", letter, includeLaunchers);
+                            CheckDir(sub, Path.GetFileName(sub), "Epic Games");
                         }
                     }
                     catch (Exception ex) { Logger.Debug("GameBoostService.cs: " + ex.Message); }
@@ -547,35 +570,6 @@ public static class GameBoostService
             }
             return finalQuery.OrderByDescending(g => g.SizeBytes).ToList();
         });
-    }
-
-    private static void CheckDir(List<InstalledGameInfo> list, HashSet<string> seen, string path, string name, string cat, string letter, bool includeLaunchers = true)
-    {
-        if (!includeLaunchers && IsMinecraftLauncher(name, path, cat)) return;
-        if (!Directory.Exists(path)) return;
-
-        string resolvedPath = path;
-        string actualLetter = letter;
-        try
-        {
-            var di = new DirectoryInfo(path);
-            if ((di.Attributes & FileAttributes.ReparsePoint) != 0)
-            {
-                var target = di.ResolveLinkTarget(returnFinalTarget: true);
-                if (target != null && Directory.Exists(target.FullName))
-                {
-                    resolvedPath = target.FullName;
-                    actualLetter = Path.GetPathRoot(resolvedPath)?.TrimEnd('\\', ':') ?? letter;
-                }
-            }
-        }
-        catch { }
-
-        if (seen.Add(resolvedPath))
-        {
-            long sz = GetFolderSizeFast(resolvedPath);
-            list.Add(new InstalledGameInfo(name, resolvedPath, cat, actualLetter, sz, StorageService.FormatBytes(sz)));
-        }
     }
 
     private static long GetFolderSizeFast(string folderPath)

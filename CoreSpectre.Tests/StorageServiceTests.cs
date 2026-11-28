@@ -273,6 +273,43 @@ public class StorageServiceTests
         Assert.True(StorageService.ElevatedWorkerInactivityTimeout > StorageService.LongSystemOperationInactivityTimeout);
     }
 
+    [Theory]
+    [InlineData("The system is in the Compact state.", true)]
+    [InlineData("The system is not in the Compact state.", false)]
+    [InlineData("Система находится в сжатом состоянии.", true)]
+    [InlineData("Система не находится в компактном состоянии.", false)]
+    [InlineData("Unexpected compact.exe output", null)]
+    public void ParseCompactOsState_DoesNotConfuseUnknownOrNegativeOutput(string output, bool? expected)
+        => Assert.Equal(expected, StorageService.ParseCompactOsState(output));
+
+    [Fact]
+    public void CleanupRoot_RequiresAnAbsoluteSubdirectory()
+    {
+        Assert.False(StorageService.TryGetCleanupRoot("Temp", out _));
+        Assert.False(StorageService.TryGetCleanupRoot(Path.GetPathRoot(AppContext.BaseDirectory)!, out _));
+        Assert.True(StorageService.TryGetCleanupRoot(AppContext.BaseDirectory, out _));
+    }
+
+    [Fact]
+    public async Task RunProcessWithWatchdogAsync_ReportsPreCancelledWithoutStartingProcess()
+    {
+        var result = await StorageService.RunProcessWithWatchdogAsync(new ProcessStartInfo(""), TimeSpan.FromSeconds(1),
+            cancellationToken: new CancellationToken(canceled: true));
+        Assert.True(result.Cancelled);
+        Assert.False(result.TimedOut);
+    }
+
+    [Fact]
+    public async Task RunProcessWithWatchdogAsync_HardDeadlineIsNotExtendedByOutput()
+    {
+        var lines = new List<string>();
+        var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+            "/d /q /c \"for /L %i in (1,1,7) do (echo tick & ping -n 2 127.0.0.1 >nul)\"");
+        var result = await StorageService.RunProcessWithWatchdogAsync(psi, TimeSpan.FromSeconds(3), lines.Add, resetOnOutput: false);
+        Assert.True(result.TimedOut);
+        Assert.Contains("tick", lines);
+    }
+
     [Fact]
     public async Task RunProcessWithWatchdogAsync_ResetsWatchdogOnOutputAndCompletes()
     {

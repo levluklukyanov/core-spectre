@@ -6,6 +6,7 @@ using Xunit;
 
 namespace CoreSpectre.Tests;
 
+[Collection("Settings files")]
 public class SettingsPersistenceTests
 {
     [Fact]

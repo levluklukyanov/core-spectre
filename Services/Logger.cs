@@ -21,12 +21,13 @@ public static class Logger
 
     static Logger()
     {
-        _logDir = Path.Combine(
+        _logDir = AppContext.GetData("CoreSpectre.LogDirectory") as string ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CoreSpectre",
             "logs");
-        _appLogFile = Path.Combine(_logDir, "app.log");
-        _crashLogFile = Path.Combine(_logDir, "crash_log.txt");
+        bool isWorker = Environment.GetCommandLineArgs().Contains("--elevated-worker", StringComparer.OrdinalIgnoreCase);
+        _appLogFile = Path.Combine(_logDir, isWorker ? "worker.log" : "app.log");
+        _crashLogFile = Path.Combine(_logDir, isWorker ? "worker_crash_log.txt" : "crash_log.txt");
 
         try
         {

@@ -93,7 +93,7 @@ internal sealed record ProcessWatchdogResult(
     bool Cancelled
 );
 
-public static class StorageService
+public static partial class StorageService
 {
     internal static readonly TimeSpan LongSystemOperationInactivityTimeout = TimeSpan.FromMinutes(15);
     internal static readonly TimeSpan ElevatedWorkerInactivityTimeout = TimeSpan.FromMinutes(16);
@@ -102,8 +102,12 @@ public static class StorageService
         ProcessStartInfo psi,
         TimeSpan inactivityTimeout,
         Action<string>? onOutputLine = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool resetOnOutput = true)
     {
+        if (cancellationToken.IsCancellationRequested)
+            return new ProcessWatchdogResult(-1, TimedOut: false, Cancelled: true);
+
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         Encoding outputEncoding = Encoding.UTF8;
         try
@@ -122,76 +126,70 @@ public static class StorageService
 
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start process '{psi.FileName}'.");
+        using var stdout = proc.StandardOutput;
+        using var stderr = proc.StandardError;
 
         using var watchdogCts = new CancellationTokenSource();
         watchdogCts.CancelAfter(inactivityTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, watchdogCts.Token);
 
-        void ResetWatchdog()
-        {
-            try
-            {
-                if (!watchdogCts.IsCancellationRequested)
-                {
-                    watchdogCts.CancelAfter(inactivityTimeout);
-                }
-            }
-            catch (ObjectDisposedException) { }
-        }
+        var outputLock = new object();
 
         async Task DrainStreamAsync(StreamReader reader)
         {
-            try
+            while (await reader.ReadLineAsync(linkedCts.Token).ConfigureAwait(false) is { } line)
             {
-                while (true)
+                try
                 {
-                    string? line = await reader.ReadLineAsync(linkedCts.Token).ConfigureAwait(false);
-                    if (line == null) break;
-                    ResetWatchdog();
-                    string trimmed = line.Trim();
-                    if (!string.IsNullOrEmpty(trimmed))
-                    {
-                        onOutputLine?.Invoke(trimmed);
-                    }
+                    if (linkedCts.IsCancellationRequested) break;
+                    if (resetOnOutput && !watchdogCts.IsCancellationRequested)
+                        watchdogCts.CancelAfter(inactivityTimeout);
                 }
-            }
-            catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
-            {
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                string trimmed = line.Trim();
+                if (onOutputLine != null && trimmed.Length > 0)
+                {
+                    lock (outputLock) onOutputLine(trimmed);
+                }
             }
         }
 
-        Task stdoutTask = DrainStreamAsync(proc.StandardOutput);
-        Task stderrTask = DrainStreamAsync(proc.StandardError);
+        Task drainTask = Task.WhenAll(DrainStreamAsync(stdout), DrainStreamAsync(stderr));
+        bool completed = false;
 
         try
         {
             await proc.WaitForExitAsync(linkedCts.Token).ConfigureAwait(false);
-            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+            await drainTask.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+            linkedCts.Token.ThrowIfCancellationRequested();
+            completed = true;
             return new ProcessWatchdogResult(proc.ExitCode, TimedOut: false, Cancelled: false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
         {
-            try
-            {
-                if (!proc.HasExited)
-                {
-                    proc.Kill(entireProcessTree: true);
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Debug($"Process tree kill failed for {psi.FileName}: {ex.Message}");
-            }
-
-            try
-            {
-                await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-            }
-            catch { }
-
             bool cancelled = cancellationToken.IsCancellationRequested;
-            bool timedOut = !cancelled && watchdogCts.IsCancellationRequested;
-            return new ProcessWatchdogResult(-1, TimedOut: timedOut, Cancelled: cancelled);
+            return new ProcessWatchdogResult(-1, TimedOut: !cancelled, Cancelled: cancelled);
+        }
+        finally
+        {
+            if (!completed)
+            {
+                linkedCts.Cancel();
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); }
+                catch (Exception ex) { Logger.Debug($"Process tree kill failed for {psi.FileName}: {ex.Message}"); }
+
+                try { await drainTask.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); }
+                catch (TimeoutException)
+                {
+                    _ = drainTask.ContinueWith(static t => { _ = t.Exception; }, CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or IOException) { }
+                catch (Exception ex) { Logger.Debug($"Process output drain failed for {psi.FileName}: {ex.Message}"); }
+            }
         }
     }
     [DllImport("Shell32.dll", CharSet = CharSet.Unicode)]
@@ -233,7 +231,7 @@ public static class StorageService
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
 
-    private static readonly Regex ValidPipeRegex = new(@"^CoreSpectre_Elev_[0-9a-fA-F]{32}$", RegexOptions.Compiled);
+    private static readonly Regex ValidPipeRegex = new(@"\ACoreSpectre_Elev_[0-9a-fA-F]{32}\z", RegexOptions.Compiled);
 
     public static bool IsValidPipeName(string? pipeName) =>
         !string.IsNullOrWhiteSpace(pipeName) && ValidPipeRegex.IsMatch(pipeName);
@@ -332,9 +330,19 @@ public static class StorageService
 
     private static bool IsFinalPathWithinRoot(string path, string normalizedAllowedRoot, bool isDirectory)
     {
+        string? resolved = ResolveFinalPath(path, isDirectory, followLinks: false);
+        return resolved != null && (resolved.Equals(normalizedAllowedRoot, StringComparison.OrdinalIgnoreCase) ||
+            resolved.StartsWith(normalizedAllowedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static string? ResolveDirectoryPath(string path) => Path.IsPathFullyQualified(path)
+        ? ResolveFinalPath(path, isDirectory: true, followLinks: true) : null;
+
+    private static string? ResolveFinalPath(string path, bool isDirectory, bool followLinks)
+    {
         try
         {
-            uint flags = FILE_FLAG_OPEN_REPARSE_POINT | (isDirectory ? FILE_FLAG_BACKUP_SEMANTICS : 0u);
+            uint flags = (followLinks ? 0u : FILE_FLAG_OPEN_REPARSE_POINT) | (isDirectory ? FILE_FLAG_BACKUP_SEMANTICS : 0u);
             IntPtr handle = CreateFileW(
                 path,
                 FILE_READ_ATTRIBUTES,
@@ -345,18 +353,18 @@ public static class StorageService
                 IntPtr.Zero);
 
             if (handle == IntPtr.Zero || handle == new IntPtr(-1))
-                return false;
+                return null;
 
             try
             {
                 var sb = new StringBuilder(1024);
                 uint len = GetFinalPathNameByHandleW(handle, sb, (uint)sb.Capacity, 0);
-                if (len == 0) return false;
+                if (len == 0) return null;
                 if (len >= sb.Capacity)
                 {
                     sb = new StringBuilder((int)len + 2);
                     len = GetFinalPathNameByHandleW(handle, sb, (uint)sb.Capacity, 0);
-                    if (len == 0) return false;
+                    if (len == 0 || len >= sb.Capacity) return null;
                 }
 
                 string resolved = sb.ToString();
@@ -365,9 +373,7 @@ public static class StorageService
                 else if (resolved.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
                     resolved = resolved[4..];
 
-                resolved = Path.GetFullPath(resolved).TrimEnd(Path.DirectorySeparatorChar);
-                return resolved.Equals(normalizedAllowedRoot, StringComparison.OrdinalIgnoreCase) ||
-                       resolved.StartsWith(normalizedAllowedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+                return Path.TrimEndingDirectorySeparator(Path.GetFullPath(resolved));
             }
             finally
             {
@@ -376,7 +382,7 @@ public static class StorageService
         }
         catch
         {
-            return false;
+            return null;
         }
     }
 
@@ -446,6 +452,7 @@ public static class StorageService
     {
         var dirs = new List<string>();
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!Path.IsPathFullyQualified(localAppData)) return dirs;
 
         string[] chromiumRoots =
         [
@@ -504,9 +511,9 @@ public static class StorageService
 
         // 1. User Temp (%TEMP%)
         string userTemp = Path.GetTempPath();
-        if (Directory.Exists(userTemp))
+        if (TryGetCleanupRoot(userTemp, out _))
         {
-            var (bytes, count) = GetDirectorySizeSafe(userTemp, cleanableOnly: true);
+            var (bytes, count) = GetDirectorySizeSafe(userTemp, minAgeDays: settings.TempMinAgeDays);
             string name = isEn ? "User Temporary Files (%TEMP%)" : "Пользовательский кэш (%TEMP%)";
             targets.Add(new CleanableTarget(name, userTemp, bytes, count, RequiresAdmin: false, IsSelected: IsSelectedFor("user_temp", settings.CleanTempFiles), Key: "user_temp"));
         }
@@ -517,13 +524,13 @@ public static class StorageService
         {
             if (isAdmin)
             {
-                var (bytes, count) = GetDirectorySizeSafe(winTemp, cleanableOnly: true);
+                var (bytes, count) = GetDirectorySizeSafe(winTemp, minAgeDays: settings.TempMinAgeDays);
                 string name = isEn ? "Windows System Temp Cache" : "Системный кэш Windows Temp";
                 targets.Add(new CleanableTarget(name, winTemp, bytes, count, RequiresAdmin: false, IsSelected: IsSelectedFor("win_temp", settings.CleanTempFiles), Key: "win_temp"));
             }
             else
             {
-                var (totalBytes, count) = GetDirectorySizeSafe(winTemp, cleanableOnly: false);
+                var (totalBytes, count) = GetDirectorySizeSafe(winTemp, cleanableOnly: false, minAgeDays: settings.TempMinAgeDays);
                 string name = isEn ? "Windows System Temp (Admin Required)" : "Системный кэш Windows Temp (Нужны права админа)";
                 targets.Add(new CleanableTarget(name, winTemp, totalBytes, count, RequiresAdmin: true, IsSelected: IsSelectedFor("win_temp", settings.CleanTempFiles), Key: "win_temp"));
             }
@@ -648,18 +655,20 @@ public static class StorageService
         return targets;
     }
 
-    private static (long bytes, int count) GetRecycleBinSize()
+    private static (long bytes, int count) GetRecycleBinSize(CancellationToken cancellationToken = default)
     {
         long binBytes = 0;
         int binCount = 0;
-        foreach (var drive in DriveInfo.GetDrives().Where(d => d.IsReady))
+        foreach (var drive in DriveInfo.GetDrives())
         {
+            if (cancellationToken.IsCancellationRequested) break;
             try
             {
+                if (!drive.IsReady) continue;
                 string rbPath = Path.Combine(drive.RootDirectory.FullName, "$Recycle.Bin");
                 if (Directory.Exists(rbPath))
                 {
-                    var (b, c) = GetDirectorySizeSafe(rbPath, cleanableOnly: true);
+                    var (b, c) = GetDirectorySizeSafe(rbPath, cancellationToken: cancellationToken);
                     binBytes += b;
                     binCount += c;
                 }
@@ -676,22 +685,15 @@ public static class StorageService
         int skipped = 0;
         DateTime? cutoffUtc = minAgeDays > 0 ? DateTime.UtcNow.AddDays(-minAgeDays) : null;
 
-        if (!Directory.Exists(path)) return new CleanResult(0, 0, 0);
-
-        string allowedRoot;
-        try
-        {
-            allowedRoot = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
-        }
-        catch
-        {
-            return new CleanResult(0, 0, 0);
-        }
+        if (cancellationToken.IsCancellationRequested) return new CleanResult(0, 0, 0);
+        if (!TryGetCleanupRoot(path, out string allowedRoot))
+            return new CleanResult(0, 0, 0, HasErrors: true);
+        if (!Directory.Exists(allowedRoot)) return new CleanResult(0, 0, 0);
 
         if (!IsFinalPathWithinRoot(allowedRoot, allowedRoot, isDirectory: true))
         {
             Logger.Warn($"[StorageService] Skipped cleanup root (reparse/path mismatch): {allowedRoot}");
-            return new CleanResult(0, 0, 0);
+            return new CleanResult(0, 0, 0, HasErrors: true);
         }
 
         var dirStack = new Stack<string>();
@@ -803,6 +805,20 @@ public static class StorageService
         return new CleanResult(freed, count, skipped);
     }
 
+    internal static bool TryGetCleanupRoot(string path, out string root)
+    {
+        root = "";
+        if (!Path.IsPathFullyQualified(path)) return false;
+        try
+        {
+            root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+            return !string.Equals(root, Path.GetPathRoot(root), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException) { return false; }
+        catch (IOException) { return false; }
+        catch (NotSupportedException) { return false; }
+    }
+
     public static async Task<CleanResult> ExecuteDeepCleanupAsync(
         bool isEn,
         Action<string> logCallback,
@@ -810,20 +826,23 @@ public static class StorageService
         bool adminStagesOnly = false,
         CancellationToken cancellationToken = default)
     {
-        var loadedSettings = SettingsPersistenceService.Load();
-        options ??= new StorageCleanupOptions(
-            loadedSettings.CleanTempFiles,
-            loadedSettings.CleanSoftwareDistribution,
-            loadedSettings.CleanLogsAndReports,
-            loadedSettings.CleanDnsCache,
-            loadedSettings.CleanRecycleBin,
-            loadedSettings.CleanGpuShaderCache,
-            loadedSettings.CleanBrowserCache,
-            loadedSettings.CleanDismComponentCleanup,
-            loadedSettings.CleanDismResetBase,
-            new HashSet<string>(loadedSettings.DisabledCleanupTargets ?? new List<string>(), StringComparer.OrdinalIgnoreCase),
-            loadedSettings.TempMinAgeDays
-        );
+        if (options == null)
+        {
+            var loadedSettings = SettingsPersistenceService.Load();
+            options = new StorageCleanupOptions(
+                loadedSettings.CleanTempFiles,
+                loadedSettings.CleanSoftwareDistribution,
+                loadedSettings.CleanLogsAndReports,
+                loadedSettings.CleanDnsCache,
+                loadedSettings.CleanRecycleBin,
+                loadedSettings.CleanGpuShaderCache,
+                loadedSettings.CleanBrowserCache,
+                loadedSettings.CleanDismComponentCleanup,
+                loadedSettings.CleanDismResetBase,
+                new HashSet<string>(loadedSettings.DisabledCleanupTargets, StringComparer.OrdinalIgnoreCase),
+                loadedSettings.TempMinAgeDays
+            );
+        }
 
         var disabled = options.DisabledTargetKeys ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -891,6 +910,7 @@ public static class StorageService
                 totalFreed += r1.BytesFreed;
                 totalRemoved += r1.FilesRemoved;
                 totalSkipped += r1.FilesSkipped;
+                hasErrors |= r1.HasErrors;
             }
 
             if (cleanWinTemp && !cancellationToken.IsCancellationRequested)
@@ -902,6 +922,7 @@ public static class StorageService
                     totalFreed += r2.BytesFreed;
                     totalRemoved += r2.FilesRemoved;
                     totalSkipped += r2.FilesSkipped;
+                    hasErrors |= r2.HasErrors;
                 }
                 else
                 {
@@ -933,40 +954,22 @@ public static class StorageService
                     ? "[2/7] Cleaning Windows Update and Delivery Optimization caches..."
                     : "[2/7] Очистка кэша обновлений Windows и Delivery Optimization...");
 
-                string netExe = Path.Combine(Environment.SystemDirectory, "net.exe");
-                foreach (var svc in new[] { "wuauserv", "dosvc" })
-                {
-                    try
-                    {
-                        var psiStop = new ProcessStartInfo(netExe, $"stop {svc}") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden };
-                        using var pStop = Process.Start(psiStop);
-                        pStop?.WaitForExit(2500);
-                    }
-                    catch (Exception ex) { Logger.Debug("StorageService.cs: " + ex.Message); }
-                }
-
                 if (cleanSwDist && !cancellationToken.IsCancellationRequested)
                 {
-                    var r3 = CleanDirectoryContents(swDist, cancellationToken);
+                    var r3 = await CleanStoppedServiceCacheAsync("wuauserv", swDist, logCallback, isEn, cancellationToken);
                     totalFreed += r3.BytesFreed;
                     totalRemoved += r3.FilesRemoved;
                     totalSkipped += r3.FilesSkipped;
+                    hasErrors |= r3.HasErrors;
                 }
                 if (cleanDelivOpt && !cancellationToken.IsCancellationRequested)
                 {
-                    var r4 = CleanDirectoryContents(delivOpt, cancellationToken);
+                    var r4 = await CleanStoppedServiceCacheAsync("dosvc", delivOpt, logCallback, isEn, cancellationToken);
                     totalFreed += r4.BytesFreed;
                     totalRemoved += r4.FilesRemoved;
                     totalSkipped += r4.FilesSkipped;
+                    hasErrors |= r4.HasErrors;
                 }
-
-                try
-                {
-                    var psiStart = new ProcessStartInfo(netExe, "start wuauserv") { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden };
-                    using var pStart = Process.Start(psiStart);
-                    pStart?.WaitForExit(2500);
-                }
-                catch (Exception ex) { Logger.Debug("StorageService.cs: " + ex.Message); }
             }
             else
             {
@@ -1002,6 +1005,7 @@ public static class StorageService
                 totalFreed += r5.BytesFreed;
                 totalRemoved += r5.FilesRemoved;
                 totalSkipped += r5.FilesSkipped;
+                hasErrors |= r5.HasErrors;
             }
 
             if (cleanWer && !cancellationToken.IsCancellationRequested)
@@ -1013,6 +1017,7 @@ public static class StorageService
                     totalFreed += r6.BytesFreed + r7.BytesFreed;
                     totalRemoved += r6.FilesRemoved + r7.FilesRemoved;
                     totalSkipped += r6.FilesSkipped + r7.FilesSkipped;
+                    hasErrors |= r6.HasErrors || r7.HasErrors;
                 }
 
                 if (isAdmin)
@@ -1022,6 +1027,7 @@ public static class StorageService
                     totalFreed += r8.BytesFreed + r9.BytesFreed;
                     totalRemoved += r8.FilesRemoved + r9.FilesRemoved;
                     totalSkipped += r8.FilesSkipped + r9.FilesSkipped;
+                    hasErrors |= r8.HasErrors || r9.HasErrors;
                 }
                 else
                 {
@@ -1041,6 +1047,7 @@ public static class StorageService
                     totalFreed += r10.BytesFreed;
                     totalRemoved += r10.FilesRemoved;
                     totalSkipped += r10.FilesSkipped;
+                    hasErrors |= r10.HasErrors;
                 }
                 else
                 {
@@ -1078,6 +1085,7 @@ public static class StorageService
                         totalFreed += r.BytesFreed;
                         totalRemoved += r.FilesRemoved;
                         totalSkipped += r.FilesSkipped;
+                        hasErrors |= r.HasErrors;
                     }
                 }
 
@@ -1090,6 +1098,7 @@ public static class StorageService
                         totalFreed += r.BytesFreed;
                         totalRemoved += r.FilesRemoved;
                         totalSkipped += r.FilesSkipped;
+                        hasErrors |= r.HasErrors;
                     }
                 }
             }
@@ -1113,17 +1122,11 @@ public static class StorageService
                 try
                 {
                     string ipconfigPath = Path.Combine(Environment.SystemDirectory, "ipconfig.exe");
-                    var psi = new ProcessStartInfo(ipconfigPath, "/flushdns")
-                    {
-                        CreateNoWindow = true,
-                        UseShellExecute = false,
-                        WindowStyle = ProcessWindowStyle.Hidden
-                    };
-                    using var p = Process.Start(psi);
-                    if (p != null) await p.WaitForExitAsync(cancellationToken);
+                    var res = await RunProcessWithWatchdogAsync(new ProcessStartInfo(ipconfigPath, "/flushdns"),
+                        TimeSpan.FromSeconds(15), logCallback, cancellationToken, resetOnOutput: false);
+                    hasErrors |= !res.Cancelled && res.ExitCode != 0;
                 }
-                catch (OperationCanceledException) { }
-                catch (Exception ex) { Logger.Debug("StorageService.cs: " + ex.Message); }
+                catch (Exception ex) { hasErrors = true; Logger.Debug("StorageService.cs: " + ex.Message); }
             }
             else
             {
@@ -1142,36 +1145,38 @@ public static class StorageService
                     ? "[6/7] Emptying Windows Recycle Bin across all drives..."
                     : "[6/7] Очистка Корзины на всех накопителях...");
 
-                var (binBytesBefore, binCountBefore) = GetRecycleBinSize();
-                try
+                var (binBytesBefore, binCountBefore) = GetRecycleBinSize(cancellationToken);
+                if (!cancellationToken.IsCancellationRequested)
                 {
-                    uint hr = SHEmptyRecycleBin(IntPtr.Zero, null, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
-                    if (hr != 0 && hr != 0x8000FFFFu)
-                    {
-                        throw new COMException($"SHEmptyRecycleBin returned 0x{hr:X8}", unchecked((int)hr));
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Debug($"SHEmptyRecycleBin fallback triggered: {ex.Message}");
                     try
                     {
-                        string psPath = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
-                        var psi = new ProcessStartInfo(psPath, "-NoProfile -NonInteractive -Command \"Clear-RecycleBin -Confirm:$false -ErrorAction SilentlyContinue\"")
-                        {
-                            CreateNoWindow = true,
-                            UseShellExecute = false,
-                            WindowStyle = ProcessWindowStyle.Hidden
-                        };
-                        using var p = Process.Start(psi);
-                        if (p != null) await p.WaitForExitAsync(cancellationToken);
+                        uint hr = SHEmptyRecycleBin(IntPtr.Zero, null, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
+                        if (hr != 0 && hr != 0x8000FFFFu)
+                            throw new COMException($"SHEmptyRecycleBin returned 0x{hr:X8}", unchecked((int)hr));
                     }
-                    catch (OperationCanceledException) { }
-                    catch (Exception psEx) { Logger.Debug("StorageService.cs: " + psEx.Message); }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug($"SHEmptyRecycleBin fallback triggered: {ex.Message}");
+                        try
+                        {
+                            string psPath = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
+                            var psi = new ProcessStartInfo(psPath, "-NoProfile -NonInteractive -Command \"Clear-RecycleBin -Confirm:$false -ErrorAction Stop\"");
+                            var res = await RunProcessWithWatchdogAsync(psi, TimeSpan.FromSeconds(60), logCallback,
+                                cancellationToken, resetOnOutput: false);
+                            hasErrors |= !res.Cancelled && res.ExitCode != 0;
+                        }
+                        catch (Exception psEx) { hasErrors = true; Logger.Debug("StorageService.cs: " + psEx.Message); }
+                    }
                 }
-                var (binBytesAfter, binCountAfter) = GetRecycleBinSize();
-                totalFreed += Math.Max(0, binBytesBefore - binBytesAfter);
-                totalRemoved += Math.Max(0, binCountBefore - binCountAfter);
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    var (binBytesAfter, binCountAfter) = GetRecycleBinSize(cancellationToken);
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                        totalFreed += Math.Max(0, binBytesBefore - binBytesAfter);
+                        totalRemoved += Math.Max(0, binCountBefore - binCountAfter);
+                    }
+                }
             }
             else
             {
@@ -1303,9 +1308,10 @@ public static class StorageService
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             using var pipeServer = CreateSecurePipeServer(pipeName);
 
-            string exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
+            string exePath = Environment.ProcessPath ?? "";
             if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
             {
                 exePath = Path.Combine(AppContext.BaseDirectory, "CoreSpectre.exe");
@@ -1321,50 +1327,43 @@ public static class StorageService
                 WindowStyle = ProcessWindowStyle.Hidden
             };
 
-            using var proc = Process.Start(psi);
+            using var proc = await Task.Run(() => Process.Start(psi), cancellationToken);
             if (proc == null)
             {
                 string msg = isEn ? "Could not start elevated worker process." : "Не удалось запустить фоновый процесс с правами администратора.";
                 return new ElevatedWorkerRunResult(false, null, msg);
             }
 
-            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            connectCts.CancelAfter(TimeSpan.FromSeconds(25));
-            Task exitMonitor = proc.WaitForExitAsync(connectCts.Token);
-            var connectTask = pipeServer.WaitForConnectionAsync(connectCts.Token);
-            await Task.WhenAny(connectTask, exitMonitor);
-
-            if (!pipeServer.IsConnected)
-            {
-                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch (Exception ex) { Logger.Debug($"Worker kill failed: {ex.Message}"); }
-                string errMsg = cancellationToken.IsCancellationRequested
-                    ? (isEn ? "Elevated operation cancelled." : "Операция с правами администратора отменена.")
-                    : (isEn ? "Elevated worker closed before connecting to secure channel." : "Повышенный процесс завершился до подключения к каналу.");
-                return new ElevatedWorkerRunResult(false, null, errMsg);
-            }
-
-            using (var writer = new StreamWriter(pipeServer, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true })
-            {
-                await writer.WriteLineAsync(JsonSerializer.Serialize(job));
-            }
-
             using var workerWatchdogCts = new CancellationTokenSource(ElevatedWorkerInactivityTimeout);
             using var execCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, workerWatchdogCts.Token);
-            using var reader = new StreamReader(pipeServer, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
-
-            CleanResult? adminResult = null;
             try
             {
-                while (await reader.ReadLineAsync(execCts.Token) is { } frame)
+                using (var connectCts = CancellationTokenSource.CreateLinkedTokenSource(execCts.Token))
                 {
+                    connectCts.CancelAfter(TimeSpan.FromSeconds(25));
+                    Task exitMonitor = proc.WaitForExitAsync(connectCts.Token);
+                    Task connectTask = pipeServer.WaitForConnectionAsync(connectCts.Token);
                     try
                     {
-                        if (!workerWatchdogCts.IsCancellationRequested)
-                        {
-                            workerWatchdogCts.CancelAfter(ElevatedWorkerInactivityTimeout);
-                        }
+                        Task first = await Task.WhenAny(connectTask, exitMonitor);
+                        await first;
+                        if (!connectTask.IsCompletedSuccessfully)
+                            return new ElevatedWorkerRunResult(false, null, isEn
+                                ? "Elevated worker exited before connecting."
+                                : "Повышенный процесс завершился до подключения.");
                     }
-                    catch (ObjectDisposedException) { }
+                    finally
+                    {
+                        connectCts.Cancel();
+                        await Task.WhenAll(connectTask, exitMonitor).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing | ConfigureAwaitOptions.ContinueOnCapturedContext);
+                    }
+                }
+
+                await pipeServer.WriteAsync(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(job) + "\n"), execCts.Token);
+                using var reader = new StreamReader(pipeServer, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+                while (await reader.ReadLineAsync(execCts.Token) is { } frame)
+                {
+                    workerWatchdogCts.CancelAfter(ElevatedWorkerInactivityTimeout);
 
                     if (frame.StartsWith("LOG:", StringComparison.Ordinal))
                     {
@@ -1374,44 +1373,36 @@ public static class StorageService
                     else if (frame.StartsWith("RES:", StringComparison.Ordinal))
                     {
                         string resJson = Encoding.UTF8.GetString(Convert.FromBase64String(frame[4..]));
-                        adminResult = JsonSerializer.Deserialize<CleanResult>(resJson);
-                        break;
+                        if (JsonSerializer.Deserialize<CleanResult>(resJson) is { } result)
+                            return new ElevatedWorkerRunResult(false, result, null);
                     }
                 }
+                return new ElevatedWorkerRunResult(false, null, isEn
+                    ? "Elevated worker disconnected without reporting a result."
+                    : "Повышенный процесс отключился, не передав результат.");
             }
             catch (OperationCanceledException)
             {
-                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch (Exception ex) { Logger.Debug($"Worker kill on cancel failed: {ex.Message}"); }
-                string cancelMsg = cancellationToken.IsCancellationRequested
+                // EOF cancels the job, allowing the worker to restore any stopped service.
+                pipeServer.Dispose();
+                using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+                try { await proc.WaitForExitAsync(stopCts.Token); }
+                catch (OperationCanceledException) when (stopCts.IsCancellationRequested)
+                {
+                    return new ElevatedWorkerRunResult(false, null, isEn
+                        ? "Stop requested; elevated worker exit has not been confirmed."
+                        : "Отмена запрошена; завершение повышенного процесса не подтверждено.");
+                }
+                return new ElevatedWorkerRunResult(false, null, cancellationToken.IsCancellationRequested
                     ? (isEn ? "Elevated operation cancelled by user." : "Операция с правами администратора отменена пользователем.")
-                    : (isEn ? "Elevated worker timed out." : "Превышено время ожидания операции администратора.");
-                return new ElevatedWorkerRunResult(false, null, cancelMsg);
+                    : (isEn ? "Elevated worker timed out." : "Превышено время ожидания операции администратора."));
             }
-            catch (IOException) when (adminResult != null)
-            {
-                // Worker exited cleanly after sending RES frame
-            }
-
-            try
-            {
-                await proc.WaitForExitAsync(execCts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch (Exception ex) { Logger.Debug($"Worker kill on exit wait failed: {ex.Message}"); }
-            }
-
-            if (adminResult == null && proc.ExitCode != 0)
-            {
-                string errMsg = isEn
-                    ? $"Elevated worker exited with code {proc.ExitCode}."
-                    : $"Операция с правами администратора завершилась с кодом {proc.ExitCode}.";
-                return new ElevatedWorkerRunResult(false, null, errMsg);
-            }
-
-            return new ElevatedWorkerRunResult(false, adminResult, null);
         }
-        catch (System.ComponentModel.Win32Exception)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return new ElevatedWorkerRunResult(false, null, isEn ? "Elevated operation cancelled." : "Операция с правами администратора отменена.");
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
             return new ElevatedWorkerRunResult(true, null, isEn ? "Administrator elevation cancelled." : "Предоставление прав администратора отменено.");
         }
@@ -1431,13 +1422,26 @@ public static class StorageService
         await pipeClient.ConnectAsync(connectCts.Token);
 
         using var reader = new StreamReader(pipeClient, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
-        using var writer = new StreamWriter(pipeClient, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
 
-        string? jobJson = await reader.ReadLineAsync();
+        using var jobCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        string? jobJson = await reader.ReadLineAsync(jobCts.Token);
         if (string.IsNullOrWhiteSpace(jobJson)) return 3;
 
         var job = JsonSerializer.Deserialize<ElevatedCleanupJob>(jobJson);
-        if (job == null) return 4;
+        if (job == null || job.TempMinAgeDays is < 0 or > 90) return 4;
+        string action = (job.Action ?? "").Trim().ToLowerInvariant();
+        if (action is not ("cleanup" or "standby" or "compact_on" or "compact_off")) return 4;
+
+        using var workCts = new CancellationTokenSource();
+        using var monitorCts = new CancellationTokenSource();
+        async Task MonitorDisconnectionAsync()
+        {
+            try { await reader.ReadAsync(new char[1].AsMemory(), monitorCts.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (monitorCts.IsCancellationRequested) { return; }
+            catch (IOException) { }
+            workCts.Cancel();
+        }
+        Task monitor = MonitorDisconnectionAsync();
 
         var pipeLock = new object();
         void SendFrame(string prefix, string payload)
@@ -1445,55 +1449,64 @@ public static class StorageService
             string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(payload));
             lock (pipeLock)
             {
+                if (workCts.IsCancellationRequested) return;
+                using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(workCts.Token);
+                writeCts.CancelAfter(TimeSpan.FromSeconds(10));
                 try
                 {
-                    writer.WriteLine($"{prefix}:{encoded}");
+                    byte[] frame = Encoding.UTF8.GetBytes($"{prefix}:{encoded}\n");
+                    pipeClient.WriteAsync(frame.AsMemory(), writeCts.Token).AsTask().GetAwaiter().GetResult();
                 }
-                catch { }
+                catch (Exception ex) when (ex is IOException or OperationCanceledException) { workCts.Cancel(); }
             }
         }
 
-        CleanResult result;
-        string action = (job.Action ?? "cleanup").Trim().ToLowerInvariant();
-        if (action == "standby")
+        try
         {
-            var (ok, freed, msg) = MemoryService.PurgeStandbyList(job.IsEnglish);
-            SendFrame("LOG", msg);
-            result = new CleanResult(freed, 0, 0, 0, HasErrors: !ok, SummaryMessage: msg);
-        }
-        else if (action is "compact_on" or "compact_off")
-        {
-            bool enable = action == "compact_on";
-            var (ok, msg) = await SetCompactOsAsync(
-                enable,
-                job.IsEnglish,
-                line => SendFrame("LOG", $"[CompactOS] {line}"));
-            SendFrame("LOG", $"[CompactOS] {msg}");
-            result = new CleanResult(0, 0, 0, 0, HasErrors: !ok, SummaryMessage: msg);
-        }
-        else
-        {
-            var opts = new StorageCleanupOptions(
-                job.CleanTemp,
-                job.CleanSoftwareDistribution,
-                job.CleanLogsAndReports,
-                CleanDnsCache: false,
-                CleanRecycleBin: false,
-                CleanGpuShaderCache: false,
-                CleanBrowserCache: false,
-                job.CleanDismComponentCleanup,
-                job.CleanDismResetBase,
-                new HashSet<string>(job.DisabledTargetKeys ?? new List<string>(), StringComparer.OrdinalIgnoreCase),
-                TempMinAgeDays: job.TempMinAgeDays
-            );
+            if (workCts.IsCancellationRequested) return 1;
+            CleanResult result;
+            if (action == "standby")
+            {
+                var (ok, freed, msg) = MemoryService.PurgeStandbyList(job.IsEnglish);
+                SendFrame("LOG", msg);
+                result = new CleanResult(freed, 0, 0, 0, HasErrors: !ok, SummaryMessage: msg);
+            }
+            else if (action is "compact_on" or "compact_off")
+            {
+                bool enable = action == "compact_on";
+                var (ok, msg) = await SetCompactOsAsync(enable, job.IsEnglish,
+                    line => SendFrame("LOG", $"[CompactOS] {line}"), workCts.Token);
+                SendFrame("LOG", $"[CompactOS] {msg}");
+                result = new CleanResult(0, 0, 0, 0, HasErrors: !ok, SummaryMessage: msg);
+            }
+            else
+            {
+                var opts = new StorageCleanupOptions(
+                    job.CleanTemp,
+                    job.CleanSoftwareDistribution,
+                    job.CleanLogsAndReports,
+                    CleanDnsCache: false,
+                    CleanRecycleBin: false,
+                    CleanGpuShaderCache: false,
+                    CleanBrowserCache: false,
+                    job.CleanDismComponentCleanup,
+                    job.CleanDismResetBase,
+                    new HashSet<string>(job.DisabledTargetKeys ?? new List<string>(), StringComparer.OrdinalIgnoreCase),
+                    TempMinAgeDays: job.TempMinAgeDays
+                );
 
-            result = await ExecuteDeepCleanupAsync(job.IsEnglish, line => SendFrame("LOG", line), opts, adminStagesOnly: true);
-        }
+                result = await ExecuteDeepCleanupAsync(job.IsEnglish, line => SendFrame("LOG", line), opts,
+                    adminStagesOnly: true, cancellationToken: workCts.Token);
+            }
 
-        string resJson = JsonSerializer.Serialize(result);
-        SendFrame("RES", resJson);
-        try { await writer.FlushAsync(); pipeClient.WaitForPipeDrain(); } catch { }
-        return 0;
+            SendFrame("RES", JsonSerializer.Serialize(result));
+            return workCts.IsCancellationRequested ? 1 : 0;
+        }
+        finally
+        {
+            monitorCts.Cancel();
+            await monitor;
+        }
     }
 
     public static async Task<(bool Created, string? Reason)> CreateRestorePointDetailedAsync(string description, CancellationToken cancellationToken = default)
@@ -1504,38 +1517,24 @@ public static class StorageService
         {
             string safeDesc = new string((description ?? "CoreSpectre Restore Point")
                 .Where(c => !char.IsControl(c))
-                .ToArray())
-                .Replace("'", "''");
+                .ToArray());
             if (string.IsNullOrWhiteSpace(safeDesc)) safeDesc = "CoreSpectre Before Deep Cleanup";
 
-            string psScript = $"Checkpoint-Computer -Description '{safeDesc}' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop";
+            string descData = Convert.ToBase64String(Encoding.Unicode.GetBytes(safeDesc));
+            string psScript = $"$description = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{descData}')); " +
+                "Checkpoint-Computer -Description $description -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop";
             string encodedCmd = Convert.ToBase64String(Encoding.Unicode.GetBytes(psScript));
 
             string psPath = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
-            var psi = new ProcessStartInfo(psPath, $"-NoProfile -NonInteractive -EncodedCommand {encodedCmd}")
-            {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            using var p = Process.Start(psi);
-            if (p != null)
-            {
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-                string err = await p.StandardError.ReadToEndAsync(linked.Token);
-                await p.WaitForExitAsync(linked.Token);
-                if (p.ExitCode == 0 && string.IsNullOrWhiteSpace(err))
-                {
-                    return (true, null);
-                }
-                string cleanErr = err.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? $"ExitCode {p.ExitCode}";
-                return (false, cleanErr);
-            }
+            var psi = new ProcessStartInfo(psPath, $"-NoProfile -NonInteractive -EncodedCommand {encodedCmd}");
+            string? firstLine = null;
+            var res = await RunProcessWithWatchdogAsync(psi, TimeSpan.FromSeconds(30),
+                line => firstLine ??= line, cancellationToken, resetOnOutput: false);
+            if (res.Cancelled) return (false, "Cancelled");
+            if (res.TimedOut) return (false, "Restore point creation was not confirmed within 30 seconds");
+            return res.ExitCode == 0 ? (true, null) : (false, firstLine ?? $"ExitCode {res.ExitCode}");
         }
         catch (Exception ex) { Logger.Debug("StorageService.cs: " + ex.Message); return (false, ex.Message); }
-        return (false, "Unknown error");
     }
 
     public static bool LaunchSystemRestore()
@@ -1545,7 +1544,7 @@ public static class StorageService
             string rstruiPath = Path.Combine(Environment.SystemDirectory, "rstrui.exe");
             if (File.Exists(rstruiPath))
             {
-                Process.Start(new ProcessStartInfo(rstruiPath) { UseShellExecute = true });
+                using var process = Process.Start(new ProcessStartInfo(rstruiPath) { UseShellExecute = true });
                 return true;
             }
         }
@@ -1553,7 +1552,7 @@ public static class StorageService
         return false;
     }
 
-    public static List<LargeDirectory> ScanLargeDirectories(string? driveLetter = null, int maxResults = 8)
+    public static List<LargeDirectory> ScanLargeDirectories(string? driveLetter = null, int maxResults = 8, CancellationToken cancellationToken = default)
     {
         var results = new List<LargeDirectory>();
         string drive = ValidateDriveLetter(driveLetter);
@@ -1564,13 +1563,14 @@ public static class StorageService
             var rootDir = new DirectoryInfo(root);
             foreach (var dir in rootDir.EnumerateDirectories())
             {
+                if (cancellationToken.IsCancellationRequested) break;
                 if ((dir.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                 if ((dir.Attributes & FileAttributes.System) != 0 && dir.Name.StartsWith("$", StringComparison.Ordinal))
                     continue;
 
                 try
                 {
-                    long size = GetTopLevelSize(dir);
+                    long size = GetTopLevelSize(dir, cancellationToken);
                     if (size > 50L * 1024 * 1024)
                     {
                         results.Add(new LargeDirectory(dir.FullName, size, FormatBytes(size)));
@@ -1590,12 +1590,14 @@ public static class StorageService
         return results.OrderByDescending(x => x.SizeBytes).Take(maxResults).ToList();
     }
 
-    private static (long totalBytes, int fileCount) GetDirectorySizeSafe(string path, bool cleanableOnly = true)
+    private static (long totalBytes, int fileCount) GetDirectorySizeSafe(string path, bool cleanableOnly = true,
+        int minAgeDays = 0, CancellationToken cancellationToken = default)
     {
         long total = 0;
         int count = 0;
 
-        if (!Directory.Exists(path)) return (0, 0);
+        if (!Path.IsPathFullyQualified(path) || !Directory.Exists(path)) return (0, 0);
+        DateTime cutoffUtc = minAgeDays > 0 ? DateTime.UtcNow.AddDays(-minAgeDays) : DateTime.MaxValue;
 
         try
         {
@@ -1608,12 +1610,13 @@ public static class StorageService
             var dir = new DirectoryInfo(path);
             foreach (var file in dir.EnumerateFiles("*", enumOpts))
             {
+                if (cancellationToken.IsCancellationRequested) break;
                 try
                 {
-                    if (IsProtectedSelfExtractionPath(file.FullName))
+                    if (IsProtectedSelfExtractionPath(file.FullName) || file.LastWriteTimeUtc > cutoffUtc)
                         continue;
 
-                    if (cleanableOnly && !CanDeleteFile(file))
+                    if (cleanableOnly && (file.Name.Equals("CBS.log", StringComparison.OrdinalIgnoreCase) || !CanDeleteFile(file)))
                         continue;
 
                     total += file.Length;
@@ -1633,7 +1636,7 @@ public static class StorageService
         return (total, count);
     }
 
-    private static long GetTopLevelSize(DirectoryInfo dir, int maxFiles = 200_000)
+    private static long GetTopLevelSize(DirectoryInfo dir, CancellationToken cancellationToken, int maxFiles = 200_000)
     {
         long total = 0;
         int inspected = 0;
@@ -1648,6 +1651,7 @@ public static class StorageService
             };
             foreach (var file in dir.EnumerateFiles("*", enumOpts))
             {
+                if (cancellationToken.IsCancellationRequested) break;
                 try
                 {
                     total += file.Length;
@@ -1668,7 +1672,8 @@ public static class StorageService
         return total;
     }
 
-    public static List<LargeDirectory> ScanLargestFiles(string? driveLetter = null, long minBytes = 100L * 1024 * 1024, int maxResults = 15)
+    public static List<LargeDirectory> ScanLargestFiles(string? driveLetter = null, long minBytes = 100L * 1024 * 1024,
+        int maxResults = 15, CancellationToken cancellationToken = default)
     {
         var list = new List<LargeDirectory>();
         string drive = ValidateDriveLetter(driveLetter);
@@ -1684,6 +1689,7 @@ public static class StorageService
             };
             foreach (var f in new DirectoryInfo(root).EnumerateFiles("*", enumOpts))
             {
+                if (cancellationToken.IsCancellationRequested) break;
                 try
                 {
                     if (f.Length >= minBytes)
@@ -1699,7 +1705,7 @@ public static class StorageService
         return list.OrderByDescending(x => x.SizeBytes).Take(maxResults).ToList();
     }
 
-    public static List<LargeDirectory> FindBackupAndArchiveAudits()
+    public static List<LargeDirectory> FindBackupAndArchiveAudits(CancellationToken cancellationToken = default)
     {
         var audits = new List<LargeDirectory>();
         var backupDirs = new[]
@@ -1713,7 +1719,8 @@ public static class StorageService
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var dir in backupDirs)
         {
-            if (!Directory.Exists(dir)) continue;
+            if (cancellationToken.IsCancellationRequested) return audits;
+            if (!Path.IsPathFullyQualified(dir) || !Directory.Exists(dir)) continue;
             try
             {
                 var di = new DirectoryInfo(dir);
@@ -1721,7 +1728,7 @@ public static class StorageService
                     ? di.ResolveLinkTarget(true)?.FullName ?? dir
                     : dir;
                 if (!seen.Add(resolved)) continue;
-                long sz = GetTopLevelSize(new DirectoryInfo(resolved));
+                long sz = GetTopLevelSize(new DirectoryInfo(resolved), cancellationToken);
                 if (sz > 10L * 1024 * 1024)
                     audits.Add(new LargeDirectory(resolved, sz, FormatBytes(sz), IsBackupNote: true));
             }
@@ -1730,10 +1737,12 @@ public static class StorageService
 
         foreach (var d in DriveInfo.GetDrives().Where(x => x.IsReady && x.DriveType == DriveType.Fixed))
         {
+            if (cancellationToken.IsCancellationRequested) break;
             try
             {
                 foreach (var zip in d.RootDirectory.EnumerateFiles("*.zip"))
                 {
+                    if (cancellationToken.IsCancellationRequested) break;
                     if (zip.Length >= 50L * 1024 * 1024)
                     {
                         audits.Add(new LargeDirectory(zip.FullName, zip.Length, FormatBytes(zip.Length), IsBackupNote: true));
@@ -1775,12 +1784,12 @@ public static class StorageService
 
         foreach (var d in dirs)
         {
-            if (!Directory.Exists(d)) continue;
+            if (!Path.IsPathFullyQualified(d) || !Directory.Exists(d)) continue;
             try
             {
                 foreach (var f in new DirectoryInfo(d).EnumerateFiles("*", enumOpts))
                 {
-                    if (!IsProtectedSelfExtractionPath(f.FullName))
+                    if (!IsProtectedSelfExtractionPath(f.FullName) && !string.Equals(f.Name, "CBS.log", StringComparison.OrdinalIgnoreCase))
                     {
                         files.Add(f);
                     }
@@ -1800,43 +1809,40 @@ public static class StorageService
             .ToList();
     }
 
-    public static async Task<bool> IsCompactOsEnabledAsync()
+    public static async Task<bool?> IsCompactOsEnabledAsync(CancellationToken cancellationToken = default)
     {
         try
         {
-            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-            Encoding oemEnc = Encoding.GetEncoding(System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
-
             string compactExe = Path.Combine(Environment.SystemDirectory, "compact.exe");
-            var psi = new ProcessStartInfo(compactExe, "/CompactOS:query")
-            {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                StandardOutputEncoding = oemEnc,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            using var p = Process.Start(psi);
-            if (p == null) return false;
-            string output = await p.StandardOutput.ReadToEndAsync();
-            await p.WaitForExitAsync();
-
-            if (output.Contains("not in the Compact", StringComparison.OrdinalIgnoreCase) ||
-                output.Contains("не находится в сжатом", StringComparison.OrdinalIgnoreCase) ||
-                output.Contains("не сжатом", StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            return p.ExitCode == 0 ||
-                   output.Contains("in the Compact state", StringComparison.OrdinalIgnoreCase) ||
-                   output.Contains("находится в сжатом состоянии", StringComparison.OrdinalIgnoreCase);
+            var output = new StringBuilder();
+            var result = await RunProcessWithWatchdogAsync(new ProcessStartInfo(compactExe, "/CompactOS:query"),
+                TimeSpan.FromSeconds(5), line => output.AppendLine(line), cancellationToken, resetOnOutput: false)
+                .ConfigureAwait(false);
+            return result is { TimedOut: false, Cancelled: false }
+                ? ParseCompactOsState(output.ToString())
+                : null;
         }
         catch (Exception ex)
         {
             Logger.Debug($"IsCompactOsEnabledAsync failed: {ex.Message}");
-            return false;
+            return null;
         }
+    }
+
+    internal static bool? ParseCompactOsState(string output)
+    {
+        if (output.Contains("not in the Compact", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("не находится в сжатом", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("не находится в компактном", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("не сжатом", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (output.Contains("in the Compact state", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("находится в сжатом состоянии", StringComparison.OrdinalIgnoreCase) ||
+            output.Contains("находится в компактном состоянии", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return null;
     }
 
     public static async Task<(bool Success, string Message)> SetCompactOsAsync(

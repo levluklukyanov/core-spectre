@@ -19,6 +19,8 @@ public record StartupEntry(
     public string EnabledText => LocalizationService.IsEnglish
         ? (IsEnabled ? "On" : "Off")
         : (IsEnabled ? "Вкл" : "Выкл");
+
+    public string RemoveTooltip => LocalizationService.IsEnglish ? "Remove from startup" : "Удалить из автозагрузки";
 }
 
 public record StartupOperationResult(bool Success, string Message);
@@ -108,27 +110,22 @@ public static class StartupService
         try
         {
             string psPath = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
-            string script = "Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft\\*' -and ($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'Logon|Boot' }) } | Select-Object TaskName,TaskPath,State,@{N='Exec';E={($_.Actions | Select-Object -First 1).Execute}} | ConvertTo-Csv -NoTypeInformation";
+            string script = "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); " +
+                "Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskPath -notlike '\\Microsoft\\*' -and ($_.Triggers | Where-Object { $_.CimClass.CimClassName -match 'Logon|Boot' }) } | Select-Object TaskName,TaskPath,State,@{N='Exec';E={($_.Actions | Select-Object -First 1).Execute}} | ConvertTo-Csv -NoTypeInformation";
             var psi = new ProcessStartInfo(psPath, $"-NoProfile -NonInteractive -Command \"{script}\"")
             {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                WindowStyle = ProcessWindowStyle.Hidden
+                StandardOutputEncoding = System.Text.Encoding.UTF8
             };
-            using var p = Process.Start(psi);
-            if (p == null) return list;
-
-            var readTask = p.StandardOutput.ReadToEndAsync();
-            if (!p.WaitForExit(3500))
+            var lines = new List<string>();
+            var res = StorageService.RunProcessWithWatchdogAsync(psi, TimeSpan.FromSeconds(8), lines.Add, resetOnOutput: false)
+                .GetAwaiter().GetResult();
+            if (res.ExitCode != 0)
             {
-                try { p.Kill(entireProcessTree: true); } catch (Exception ex) { Logger.Debug($"StartupService kill failed: {ex.Message}"); }
+                Logger.Warn(res.TimedOut ? "Scheduled task enumeration timed out." : $"Scheduled task enumeration exited with code {res.ExitCode}.");
                 return list;
             }
-            string output = readTask.GetAwaiter().GetResult();
 
-            var lines = output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-            for (int i = 1; i < lines.Length; i++)
+            for (int i = 1; i < lines.Count; i++)
             {
                 var cols = SplitCsvLine(lines[i]);
                 if (cols.Count < 4) continue;
@@ -139,7 +136,7 @@ public static class StartupService
                 string exec = cols[3];
                 if (string.IsNullOrWhiteSpace(name)) continue;
 
-                string fullTask = (taskPath.TrimEnd('\\') + "\\" + name).Trim();
+                string fullTask = taskPath.TrimEnd('\\') + "\\" + name;
                 bool enabled = !string.Equals(state, "Disabled", StringComparison.OrdinalIgnoreCase);
 
                 list.Add(new StartupEntry(
@@ -164,8 +161,15 @@ public static class StartupService
         var res = new List<string>();
         bool inQuotes = false;
         var cur = new System.Text.StringBuilder();
-        foreach (char c in line)
+        for (int i = 0; i < line.Length; i++)
         {
+            char c = line[i];
+            if (inQuotes && c == '"' && i + 1 < line.Length && line[i + 1] == '"')
+            {
+                cur.Append('"');
+                i++;
+                continue;
+            }
             if (c == '"') { inQuotes = !inQuotes; continue; }
             if (c == ',' && !inQuotes) { res.Add(cur.ToString()); cur.Clear(); continue; }
             cur.Append(c);
@@ -200,17 +204,10 @@ public static class StartupService
         {
             try
             {
-                string schtasks = Path.Combine(Environment.SystemDirectory, "schtasks.exe");
                 string flag = enable ? "/enable" : "/disable";
-                var psi = new ProcessStartInfo(schtasks, $"/change /tn \"{entry.TaskFullPath}\" {flag}")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using var p = Process.Start(psi);
-                p?.WaitForExit(2500);
-                if (p?.ExitCode == 0)
+                var res = ChangeScheduledTask(entry, "/change", flag);
+                if (res.TimedOut) return ScheduledTaskTimedOut(isEn);
+                if (res.ExitCode == 0)
                     return new StartupOperationResult(true, isEn ? "Scheduled task updated." : "Задача планировщика обновлена.");
                 return new StartupOperationResult(false, isEn ? "Administrator privileges may be required for this task." : "Возможно, требуются права администратора для этой задачи.");
             }
@@ -256,16 +253,9 @@ public static class StartupService
         {
             try
             {
-                string schtasks = Path.Combine(Environment.SystemDirectory, "schtasks.exe");
-                var psi = new ProcessStartInfo(schtasks, $"/delete /tn \"{entry.TaskFullPath}\" /f")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using var p = Process.Start(psi);
-                p?.WaitForExit(2500);
-                if (p?.ExitCode == 0)
+                var res = ChangeScheduledTask(entry, "/delete", "/f");
+                if (res.TimedOut) return ScheduledTaskTimedOut(isEn);
+                if (res.ExitCode == 0)
                     return new StartupOperationResult(true, isEn ? $"Removed task '{entry.Name}'." : $"Задача '{entry.Name}' удалена.");
                 return new StartupOperationResult(false, isEn ? "Failed to delete scheduled task (admin required?)." : "Не удалось удалить задачу (возможно, нужны права админа).");
             }
@@ -303,4 +293,19 @@ public static class StartupService
             return new StartupOperationResult(false, ex.Message);
         }
     }
+
+    private static ProcessWatchdogResult ChangeScheduledTask(StartupEntry entry, string action, string flag)
+    {
+        var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "schtasks.exe"));
+        psi.ArgumentList.Add(action);
+        psi.ArgumentList.Add("/tn");
+        psi.ArgumentList.Add(entry.TaskFullPath);
+        psi.ArgumentList.Add(flag);
+        return StorageService.RunProcessWithWatchdogAsync(psi, TimeSpan.FromSeconds(8), resetOnOutput: false)
+            .GetAwaiter().GetResult();
+    }
+
+    private static StartupOperationResult ScheduledTaskTimedOut(bool isEn) => new(false, isEn
+        ? "Scheduled task change timed out; refresh to check its current state."
+        : "Истекло время изменения задачи; обнови список, чтобы проверить её состояние.");
 }

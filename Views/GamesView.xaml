@@ -114,10 +114,9 @@
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
-
-                        <StackPanel Grid.Column="0">
+                        <StackPanel Grid.Column="0" Margin="0,0,12,0" VerticalAlignment="Center">
                             <TextBlock x:Name="InstalledGamesSectionTitle" Text="GAMES ON THIS DEVICE" FontSize="10.5" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextMuted}"/>
-                            <TextBlock x:Name="InstalledGamesSubtitle" Text="Scan storage drives for installed games, libraries and launchers" FontSize="12" Foreground="{DynamicResource BrushTextSecondary}" Margin="0,2,0,0"/>
+                            <TextBlock x:Name="InstalledGamesSubtitle" Text="Scan storage drives for installed games, libraries and launchers" FontSize="12" Foreground="{DynamicResource BrushTextSecondary}" TextWrapping="Wrap" Margin="0,2,0,0"/>
                         </StackPanel>
 
                         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -147,8 +146,12 @@
                     <!-- Status bar for Scan (count, total size) -->
                     <Border Grid.Row="1" Background="{DynamicResource BrushBgBase}" CornerRadius="8" Padding="12,8" Margin="0,0,0,12">
                         <Grid>
-                            <TextBlock x:Name="InstalledScanStatusText" Text="Click 'Scan Drives' to discover games on your PC." FontSize="11.5" Foreground="{DynamicResource BrushTextSecondary}" VerticalAlignment="Center"/>
-                            <TextBlock x:Name="InstalledScanCountText" Text="" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="InstalledScanStatusText" Text="Click 'Scan Drives' to discover games on your PC." FontSize="11.5" Foreground="{DynamicResource BrushTextSecondary}" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,8,0"/>
+                            <TextBlock Grid.Column="1" x:Name="InstalledScanCountText" Text="" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                         </Grid>
                     </Border>
 
@@ -179,9 +182,9 @@
                         </ItemsControl>
                     </ScrollViewer>
 
-                    <TextBlock x:Name="TxtScanPlaceholder" Grid.Row="2" Text="No scan performed yet. Select a drive and click 'Scan Drives'." FontSize="12" Foreground="{DynamicResource BrushTextMuted}" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Visible"/>
+                    <TextBlock x:Name="TxtScanPlaceholder" Grid.Row="2" Text="No scan performed yet. Select a drive and click 'Scan Drives'." FontSize="12" Foreground="{DynamicResource BrushTextMuted}" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Visible" TextWrapping="Wrap"/>
 
-                    <TextBlock x:Name="InstalledGamesFooterInfo" Grid.Row="3" Text="Scans Steam, Xbox, Epic, AppData (.minecraft, .tlauncher), and custom drive game folders." FontSize="10.5" Foreground="{DynamicResource BrushTextMuted}" Margin="0,10,0,0"/>
+                    <TextBlock x:Name="InstalledGamesFooterInfo" Grid.Row="3" Text="Scans Steam, Xbox, Epic, AppData (.minecraft, .tlauncher), and custom drive game folders." FontSize="10.5" Foreground="{DynamicResource BrushTextMuted}" Margin="0,10,0,0" TextWrapping="Wrap"/>
                 </Grid>
             </Border>
         </Grid>

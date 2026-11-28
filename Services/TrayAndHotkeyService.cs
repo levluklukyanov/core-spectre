@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -34,6 +33,7 @@ public sealed class TrayAndHotkeyService : IDisposable
     private const uint MOD_ALT = 0x0001;
     private const uint MOD_CONTROL = 0x0002;
     private const uint MOD_SHIFT = 0x0004;
+    private const uint MOD_NOREPEAT = 0x4000;
     private const uint VK_H = 0x48;
     private const uint VK_L = 0x4C;
     private const uint VK_P = 0x50;
@@ -98,6 +98,8 @@ public sealed class TrayAndHotkeyService : IDisposable
     private bool _hotkeysRegistered;
     private bool _disposed;
 
+    public bool IsTrayAvailable => _trayAdded;
+
     public event Action? OnRestoreRequested;
     public event Action? OnToggleHudRequested;
     public event Action? OnToggleHudLockRequested;
@@ -117,7 +119,7 @@ public sealed class TrayAndHotkeyService : IDisposable
         _hwndSource?.AddHook(WndProc);
         _taskbarCreatedMsg = RegisterWindowMessageW("TaskbarCreated");
 
-        string exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
+        string exePath = Environment.ProcessPath ?? "";
         if (!string.IsNullOrEmpty(exePath))
         {
             ushort idx = 0;
@@ -146,9 +148,10 @@ public sealed class TrayAndHotkeyService : IDisposable
 
         if (enabled && !_hotkeysRegistered)
         {
-            bool h1 = RegisterHotKey(_hwnd, HOTKEY_HUD_TOGGLE, MOD_CONTROL | MOD_SHIFT, VK_H);
-            bool h2 = RegisterHotKey(_hwnd, HOTKEY_HUD_LOCK, MOD_CONTROL | MOD_SHIFT, VK_L);
-            bool h3 = RegisterHotKey(_hwnd, HOTKEY_QUICK_PURGE, MOD_CONTROL | MOD_SHIFT, VK_P);
+            const uint modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
+            bool h1 = RegisterHotKey(_hwnd, HOTKEY_HUD_TOGGLE, modifiers, VK_H);
+            bool h2 = RegisterHotKey(_hwnd, HOTKEY_HUD_LOCK, modifiers, VK_L);
+            bool h3 = RegisterHotKey(_hwnd, HOTKEY_QUICK_PURGE, modifiers, VK_P);
             if (!h1 || !h2 || !h3)
             {
                 Logger.Warn($"Global hotkey registration partial/failed (H={h1}, L={h2}, P={h3}).");

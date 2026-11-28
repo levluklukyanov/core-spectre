@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.IO;
 using CoreSpectre.Services;
 using Xunit;
 
@@ -66,5 +68,45 @@ public class MemoryServiceTests
         System.Diagnostics.ProcessPriorityClass priority, bool expected)
     {
         Assert.Equal(expected, MemoryService.ShouldThrottlePriority(priority));
+    }
+
+    [Fact]
+    public async Task TrackedPriority_RejectsDifferentIdentity_RestoresLiveProcess_AndPrunesOnExit()
+    {
+        var info = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/d /q /c set /p CORESPECTRE_TEST=")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardInput = true
+        };
+        using var process = Process.Start(info)!;
+        using var input = process.StandardInput;
+        try
+        {
+            process.PriorityClass = ProcessPriorityClass.Normal;
+            long created = process.StartTime.ToFileTimeUtc();
+            Assert.False(MemoryService.TryThrottleBackgroundProcess(process.Id, created - 1));
+            Assert.Equal(0, MemoryService.ActiveThrottledProcessCount);
+
+            Assert.True(MemoryService.TryThrottleBackgroundProcess(process.Id, created));
+            Assert.Equal(1, MemoryService.ActiveThrottledProcessCount);
+            process.Refresh();
+            Assert.Equal(ProcessPriorityClass.BelowNormal, process.PriorityClass);
+
+            Assert.Equal(1, MemoryService.RestoreBackgroundProcesses());
+            process.Refresh();
+            Assert.Equal(ProcessPriorityClass.Normal, process.PriorityClass);
+
+            Assert.True(MemoryService.TryThrottleBackgroundProcess(process.Id, created));
+            await input.WriteLineAsync("exit");
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            MemoryService.PruneExitedBackgroundProcesses();
+            Assert.Equal(0, MemoryService.ActiveThrottledProcessCount);
+        }
+        finally
+        {
+            if (!process.HasExited) process.Kill();
+            MemoryService.RestoreBackgroundProcesses();
+        }
     }
 }

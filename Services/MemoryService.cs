@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace CoreSpectre.Services;
 
@@ -29,6 +30,8 @@ public record PurgeResult(
 public static class MemoryService
 {
     private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const uint SYNCHRONIZE = 0x100000;
     private const uint PROCESS_SET_QUOTA = 0x0100;
     private const uint PROCESS_SET_INFORMATION = 0x0200;
 
@@ -41,13 +44,16 @@ public static class MemoryService
     private const int MemoryPurgeLowPriorityStandbyList = 5;
 
     private const int ProcessPowerThrottling = 4;
-    private const int ProcessMemoryPriority = 5;
+    private const int ProcessMemoryPriority = 0;
     private const uint PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1;
     private const uint PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1;
     private const uint MEMORY_PRIORITY_LOW = 2;
-    private const uint MEMORY_PRIORITY_NORMAL = 5;
+    private readonly record struct ThrottledProcess(long CreatedAt, ProcessPriorityClass Priority,
+        PROCESS_POWER_THROTTLING_STATE? Power, MEMORY_PRIORITY_INFORMATION? Memory);
 
-    private static readonly ConcurrentDictionary<int, ProcessPriorityClass> _throttledOriginals = new();
+    private static readonly object _throttleLock = new();
+    private static readonly object _standbyLock = new();
+    private static readonly ConcurrentDictionary<int, ThrottledProcess> _throttledOriginals = new();
 
     private static readonly HashSet<string> ProtectedSystemProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -151,9 +157,38 @@ public static class MemoryService
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", EntryPoint = "OpenProcess", SetLastError = true)]
+    private static extern SafeProcessHandle OpenPriorityProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, int pid);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetProcessInformation(IntPtr hProcess, int processInformationClass, IntPtr processInformation, int processInformationSize);
+    private static extern bool GetProcessTimes(SafeProcessHandle process, out long created, out long exited, out long kernel, out long user);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(SafeProcessHandle process, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern ProcessPriorityClass GetPriorityClass(SafeProcessHandle process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetPriorityClass(SafeProcessHandle process, ProcessPriorityClass priority);
+
+    [DllImport("kernel32.dll", EntryPoint = "GetProcessInformation", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetPowerThrottling(SafeProcessHandle process, int infoClass, ref PROCESS_POWER_THROTTLING_STATE state, uint size);
+
+    [DllImport("kernel32.dll", EntryPoint = "GetProcessInformation", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMemoryPriority(SafeProcessHandle process, int infoClass, out MEMORY_PRIORITY_INFORMATION state, uint size);
+
+    [DllImport("kernel32.dll", EntryPoint = "SetProcessInformation", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetPowerThrottling(SafeProcessHandle process, int infoClass, ref PROCESS_POWER_THROTTLING_STATE state, uint size);
+
+    [DllImport("kernel32.dll", EntryPoint = "SetProcessInformation", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetMemoryPriority(SafeProcessHandle process, int infoClass, ref MEMORY_PRIORITY_INFORMATION state, uint size);
 
     [DllImport("ntdll.dll")]
     private static extern int NtSetSystemInformation(int SystemInformationClass, ref int SystemInformation, int SystemInformationLength);
@@ -169,6 +204,11 @@ public static class MemoryService
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, [MarshalAs(UnmanagedType.Bool)] bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+    [DllImport("advapi32.dll", EntryPoint = "AdjustTokenPrivileges", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnableTokenPrivilege(IntPtr token, [MarshalAs(UnmanagedType.Bool)] bool disableAll,
+        ref TOKEN_PRIVILEGES desired, uint length, out TOKEN_PRIVILEGES previous, out uint returnedLength);
 
     public static MemoryStatus GetCurrentStatus()
     {
@@ -206,18 +246,19 @@ public static class MemoryService
         return null;
     }
 
-    private static bool EnablePrivilege(string privilegeName)
+    private static int? PurgeStandbyWithPrivilege(bool includeModified, out bool partial)
     {
-        try
+        partial = false;
+        lock (_standbyLock)
         {
             using var current = Process.GetCurrentProcess();
             if (!OpenProcessToken(current.Handle, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out IntPtr token))
-                return false;
+                return null;
 
             try
             {
-                if (!LookupPrivilegeValue(null, privilegeName, out LUID luid))
-                    return false;
+                if (!LookupPrivilegeValue(null, "SeProfileSingleProcessPrivilege", out LUID luid))
+                    return null;
 
                 var tp = new TOKEN_PRIVILEGES
                 {
@@ -226,17 +267,35 @@ public static class MemoryService
                     Attributes = SE_PRIVILEGE_ENABLED
                 };
 
-                return AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero) &&
-                       Marshal.GetLastWin32Error() == 0;
+                if (!EnableTokenPrivilege(token, false, ref tp, (uint)Marshal.SizeOf<TOKEN_PRIVILEGES>(), out var previous, out _) ||
+                    Marshal.GetLastPInvokeError() != 0)
+                    return null;
+
+                try
+                {
+                    int cmdLow = MemoryPurgeLowPriorityStandbyList;
+                    int cmdStandby = MemoryPurgeStandbyList;
+                    int low = NtSetSystemInformation(SystemMemoryListInformation, ref cmdLow, sizeof(int));
+                    int full = NtSetSystemInformation(SystemMemoryListInformation, ref cmdStandby, sizeof(int));
+                    partial = full != 0 && low == 0;
+                    if (includeModified)
+                    {
+                        int cmdMod = MemoryFlushModifiedList;
+                        partial |= NtSetSystemInformation(SystemMemoryListInformation, ref cmdMod, sizeof(int)) != 0;
+                    }
+                    return full != 0 && low != 0 ? full : 0;
+                }
+                finally
+                {
+                    if (previous.PrivilegeCount > 0 &&
+                        (!AdjustTokenPrivileges(token, false, ref previous, 0, IntPtr.Zero, IntPtr.Zero) || Marshal.GetLastPInvokeError() != 0))
+                        Logger.Warn("Could not restore the Standby List privilege state.");
+                }
             }
             finally
             {
                 CloseHandle(token);
             }
-        }
-        catch
-        {
-            return false;
         }
     }
 
@@ -248,29 +307,21 @@ public static class MemoryService
         }
 
         var before = GetCurrentStatus();
-        if (!EnablePrivilege("SeProfileSingleProcessPrivilege"))
+        int? status = PurgeStandbyWithPrivilege(includeModified, out bool partial);
+        if (!status.HasValue)
         {
             return (false, 0, isEn ? "Could not enable SeProfileSingleProcessPrivilege." : "Не удалось активировать привилегию SeProfileSingleProcessPrivilege.");
         }
 
-        int cmdLow = MemoryPurgeLowPriorityStandbyList;
-        int cmdStandby = MemoryPurgeStandbyList;
-        int st1 = NtSetSystemInformation(SystemMemoryListInformation, ref cmdLow, sizeof(int));
-        int st2 = NtSetSystemInformation(SystemMemoryListInformation, ref cmdStandby, sizeof(int));
-
-        if (includeModified)
+        if (status.Value != 0)
         {
-            int cmdMod = MemoryFlushModifiedList;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmdMod, sizeof(int));
-        }
-
-        if (st2 != 0 && st1 != 0)
-        {
-            return (false, 0, isEn ? $"NtSetSystemInformation failed (NTSTATUS 0x{st2:X8})." : $"Ошибка сброса Standby List (NTSTATUS 0x{st2:X8}).");
+            return (false, 0, isEn ? $"NtSetSystemInformation failed (NTSTATUS 0x{status.Value:X8})." : $"Ошибка сброса Standby List (NTSTATUS 0x{status.Value:X8}).");
         }
 
         var after = GetCurrentStatus();
         long freed = Math.Max(0, after.AvailablePhysicalBytes - before.AvailablePhysicalBytes);
+        if (partial)
+            return (false, freed, isEn ? "Standby List purge completed only partially." : "Очистка Standby List выполнена частично.");
         string msg = isEn
             ? $"Standby List purged (available RAM: {StorageService.FormatBytes(after.AvailablePhysicalBytes)})."
             : $"Standby List очищен (доступно ОЗУ: {StorageService.FormatBytes(after.AvailablePhysicalBytes)}).";
@@ -351,8 +402,10 @@ public static class MemoryService
     public static bool ShouldThrottlePriority(ProcessPriorityClass priority) =>
         priority is ProcessPriorityClass.Normal or ProcessPriorityClass.AboveNormal or ProcessPriorityClass.High;
 
-    public static int OptimizeBackgroundProcesses(IReadOnlyCollection<string>? processWhitelist = null)
+    public static int OptimizeBackgroundProcesses(IReadOnlyCollection<string>? processWhitelist = null,
+        CancellationToken cancellationToken = default)
     {
+        PruneExitedBackgroundProcesses();
         string[] targetPatterns =
         [
             "onedrive", "dropbox", "googledrivesync", "searchindexer",
@@ -371,21 +424,15 @@ public static class MemoryService
         {
             try
             {
-                if (p.Id <= 4) continue;
+                if (cancellationToken.IsCancellationRequested || p.Id <= 4) continue;
                 string pName = p.ProcessName;
                 if (excluded.Contains(pName)) continue;
 
                 string lower = pName.ToLowerInvariant();
                 if (!targetPatterns.Any(t => lower.Contains(t))) continue;
 
-                var prev = p.PriorityClass;
-                if (ShouldThrottlePriority(prev))
-                {
-                    _throttledOriginals.TryAdd(p.Id, prev);
-                    p.PriorityClass = ProcessPriorityClass.BelowNormal;
-                    ApplyEcoQosAndMemoryPriority(p.Id, enableEco: true);
+                if (TryThrottleBackgroundProcess(p.Id, p.StartTime.ToFileTimeUtc(), cancellationToken))
                     optimized++;
-                }
             }
             catch (Exception ex) { Logger.Debug($"Background CPU opt skipped: {ex.Message}"); }
             finally { p.Dispose(); }
@@ -393,67 +440,88 @@ public static class MemoryService
         return optimized;
     }
 
+    internal static bool TryThrottleBackgroundProcess(int pid, long expectedCreationTime, CancellationToken cancellationToken = default)
+    {
+        lock (_throttleLock)
+        {
+            if (cancellationToken.IsCancellationRequested) return false;
+            using var process = OpenPriorityProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (process.IsInvalid || !GetProcessTimes(process, out long created, out _, out _, out _) ||
+                created != expectedCreationTime)
+                return false;
+
+            if (_throttledOriginals.TryGetValue(pid, out var existing) && existing.CreatedAt == created)
+                return false;
+
+            var priority = GetPriorityClass(process);
+            if (!ShouldThrottlePriority(priority) || !SetPriorityClass(process, ProcessPriorityClass.BelowNormal))
+                return false;
+
+            var power = new PROCESS_POWER_THROTTLING_STATE { Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION };
+            uint powerSize = (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>();
+            uint memorySize = (uint)Marshal.SizeOf<MEMORY_PRIORITY_INFORMATION>();
+            PROCESS_POWER_THROTTLING_STATE? originalPower = null;
+            MEMORY_PRIORITY_INFORMATION? originalMemory = null;
+            if (GetPowerThrottling(process, ProcessPowerThrottling, ref power, powerSize))
+            {
+                var eco = power;
+                eco.ControlMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                eco.StateMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                if (SetPowerThrottling(process, ProcessPowerThrottling, ref eco, powerSize)) originalPower = power;
+            }
+            if (GetMemoryPriority(process, ProcessMemoryPriority, out var memory, memorySize))
+            {
+                var low = new MEMORY_PRIORITY_INFORMATION { MemoryPriority = MEMORY_PRIORITY_LOW };
+                if (SetMemoryPriority(process, ProcessMemoryPriority, ref low, memorySize)) originalMemory = memory;
+            }
+            _throttledOriginals[pid] = new ThrottledProcess(created, priority, originalPower, originalMemory);
+            return true;
+        }
+    }
+
+    private static bool IsGoneOrReplaced(SafeProcessHandle process, long expectedCreationTime) =>
+        process.IsInvalid ? Marshal.GetLastWin32Error() == 87 /* ERROR_INVALID_PARAMETER */ :
+        WaitForSingleObject(process, 0) == 0 ||
+        (GetProcessTimes(process, out long created, out _, out _, out _) && created != expectedCreationTime);
+
+    internal static void PruneExitedBackgroundProcesses()
+    {
+        if (_throttledOriginals.IsEmpty) return;
+        lock (_throttleLock)
+        {
+            foreach (var (pid, original) in _throttledOriginals)
+            {
+                using var process = OpenPriorityProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, false, pid);
+                if (IsGoneOrReplaced(process, original.CreatedAt)) _throttledOriginals.TryRemove(pid, out _);
+            }
+        }
+    }
+
     public static int RestoreBackgroundProcesses()
     {
         int restored = 0;
-        foreach (var kvp in _throttledOriginals.ToArray())
+        lock (_throttleLock)
         {
-            try
+            PruneExitedBackgroundProcesses();
+            foreach (var (pid, original) in _throttledOriginals)
             {
-                using var p = Process.GetProcessById(kvp.Key);
-                p.PriorityClass = kvp.Value;
-                ApplyEcoQosAndMemoryPriority(p.Id, enableEco: false);
-                restored++;
-            }
-            catch (Exception ex) { Logger.Debug($"Restore background process skipped: {ex.Message}"); }
-            finally
-            {
-                _throttledOriginals.TryRemove(kvp.Key, out _);
+                using var process = OpenPriorityProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (process.IsInvalid || !GetProcessTimes(process, out long created, out _, out _, out _) || created != original.CreatedAt)
+                    continue;
+
+                bool ok = SetPriorityClass(process, original.Priority);
+                if (original.Power is { } power)
+                    ok &= SetPowerThrottling(process, ProcessPowerThrottling, ref power, (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
+                if (original.Memory is { } memory)
+                    ok &= SetMemoryPriority(process, ProcessMemoryPriority, ref memory, (uint)Marshal.SizeOf<MEMORY_PRIORITY_INFORMATION>());
+
+                if (ok)
+                {
+                    _throttledOriginals.TryRemove(pid, out _);
+                    restored++;
+                }
             }
         }
         return restored;
-    }
-
-    private static void ApplyEcoQosAndMemoryPriority(int pid, bool enableEco)
-    {
-        IntPtr hProc = OpenProcess(PROCESS_SET_INFORMATION, false, pid);
-        if (hProc == IntPtr.Zero) return;
-
-        try
-        {
-            var throttle = new PROCESS_POWER_THROTTLING_STATE
-            {
-                Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-                ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-                StateMask = enableEco ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0u
-            };
-            IntPtr pThrottle = Marshal.AllocHGlobal(Marshal.SizeOf(throttle));
-            try
-            {
-                Marshal.StructureToPtr(throttle, pThrottle, false);
-                SetProcessInformation(hProc, ProcessPowerThrottling, pThrottle, Marshal.SizeOf(throttle));
-            }
-            finally { Marshal.FreeHGlobal(pThrottle); }
-
-            var memPrio = new MEMORY_PRIORITY_INFORMATION
-            {
-                MemoryPriority = enableEco ? MEMORY_PRIORITY_LOW : MEMORY_PRIORITY_NORMAL
-            };
-            IntPtr pMem = Marshal.AllocHGlobal(Marshal.SizeOf(memPrio));
-            try
-            {
-                Marshal.StructureToPtr(memPrio, pMem, false);
-                SetProcessInformation(hProc, ProcessMemoryPriority, pMem, Marshal.SizeOf(memPrio));
-            }
-            finally { Marshal.FreeHGlobal(pMem); }
-        }
-        catch (Exception ex)
-        {
-            Logger.Debug($"ApplyEcoQosAndMemoryPriority skipped for PID {pid}: {ex.Message}");
-        }
-        finally
-        {
-            CloseHandle(hProc);
-        }
     }
 }

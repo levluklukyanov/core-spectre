@@ -352,13 +352,13 @@
                                 <TextBlock x:Name="CpuAlertTitle" Text="CPU Alert Threshold (%):" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
                                 <TextBlock x:Name="TxtCpuAlertVal" Text="90%" HorizontalAlignment="Right" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
                             </Grid>
-                            <Slider x:Name="SliderCpuAlert" Minimum="50" Maximum="99" Value="90" SmallChange="1" LargeChange="5" ValueChanged="SliderCpuAlert_ValueChanged" Margin="0,0,0,16"/>
+                            <Slider x:Name="SliderCpuAlert" Minimum="10" Maximum="100" Value="90" SmallChange="1" LargeChange="5" ValueChanged="SliderCpuAlert_ValueChanged" Margin="0,0,0,16"/>
 
                             <Grid Margin="0,0,0,10">
                                 <TextBlock x:Name="RamAlertTitle" Text="RAM Alert Threshold (%):" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
                                 <TextBlock x:Name="TxtRamAlertVal" Text="85%" HorizontalAlignment="Right" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource BrushTextPrimary}" VerticalAlignment="Center"/>
                             </Grid>
-                            <Slider x:Name="SliderRamAlert" Minimum="50" Maximum="99" Value="85" SmallChange="1" LargeChange="5" ValueChanged="SliderRamAlert_ValueChanged" Margin="0,0,0,16"/>
+                            <Slider x:Name="SliderRamAlert" Minimum="10" Maximum="100" Value="85" SmallChange="1" LargeChange="5" ValueChanged="SliderRamAlert_ValueChanged" Margin="0,0,0,16"/>
 
                             <Separator Background="{DynamicResource BrushBorderSubtle}" Margin="0,0,0,16"/>
 
@@ -407,7 +407,7 @@
                                                 <Button Grid.Column="2" Style="{StaticResource BtnPill}" Click="BtnStartupToggle_Click" Tag="{Binding}" Padding="8,4" Margin="8,0,6,0" VerticalAlignment="Center">
                                                     <TextBlock Text="{Binding EnabledText}" FontSize="11" FontWeight="SemiBold"/>
                                                 </Button>
-                                                <Button Grid.Column="3" Style="{StaticResource BtnPill}" Click="BtnStartupDelete_Click" Tag="{Binding}" Padding="8,4" VerticalAlignment="Center" ToolTip="Remove from startup">
+                                                <Button Grid.Column="3" Style="{StaticResource BtnPill}" Click="BtnStartupDelete_Click" Tag="{Binding}" Padding="8,4" VerticalAlignment="Center" ToolTip="{Binding RemoveTooltip}">
                                                     <Path Data="{StaticResource IconTrash}" Width="11" Height="11" Fill="{DynamicResource BrushTextSecondary}" Stretch="Uniform"/>
                                                 </Button>
                                             </Grid>

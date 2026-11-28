@@ -104,10 +104,10 @@ public partial class OverviewView : UserControl
         DashDiskCTitle.Text = isRu
             ? $"НАКОПИТЕЛЬ ({watchedDrive}:)"
             : $"STORAGE ({watchedDrive}:)";
-        DashDiskCVal.Text = isRu ? $"{diskFreeGb:0.0} ГБ" : $"{diskFreeGb:0.0} GB";
+        DashDiskCVal.Text = diskTotalGb <= 0 ? "—" : isRu ? $"{diskFreeGb:0.0} ГБ" : $"{diskFreeGb:0.0} GB";
         double diskUsedPercent = diskTotalGb > 0 ? ((diskTotalGb - diskFreeGb) / diskTotalGb) * 100.0 : 0;
         DashDiskCProgress.Value = Math.Clamp(diskUsedPercent, 0, 100);
-        DashDiskCSub.Text = isRu
+        DashDiskCSub.Text = diskTotalGb <= 0 ? (isRu ? "Диск недоступен" : "Drive unavailable") : isRu
             ? $"Свободно {diskFreeGb:0.0} из {diskTotalGb:0.0} ГБ"
             : $"Free {diskFreeGb:0.0} of {diskTotalGb:0.0} GB";
 

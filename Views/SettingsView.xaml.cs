@@ -20,6 +20,7 @@ public partial class SettingsView : UserControl
     private readonly Dictionary<Expander, bool> _accordionCollapsing = new();
     private int _animTokenSeq = 0;
     private bool _sysInfoLoaded = false;
+    private bool _sysInfoLoading;
     private bool _isInitializing = false;
     private bool _isEditingTabs = false;
     private string _currentLanguage = "EN";
@@ -31,6 +32,11 @@ public partial class SettingsView : UserControl
     private bool _enableGlobalHotkeys = true;
     private bool _enableThresholdAlerts = true;
     private double _ramThresholdValue = 85.0;
+    private double _intervalSeconds = 1.0;
+    private double _diskThresholdGb = 7.0;
+    private Expander? _stickyExpander;
+    private bool _startupChanging;
+    private int _startupRefreshVersion;
     private List<StartupEntry> _startupEntries = new();
 
     // Cached hardware specs
@@ -74,6 +80,7 @@ public partial class SettingsView : UserControl
     {
         InitializeComponent();
         ExpCustom.Collapsed += (s, e) => OnTabEditShouldDisable?.Invoke();
+        Loaded += (_, _) => _ = RefreshStartupListAsync();
     }
 
     public void ApplyLanguage(string language)
@@ -145,6 +152,8 @@ public partial class SettingsView : UserControl
         RamAlertTitle.Text = isEn ? "RAM Alert Threshold (%):" : "Порог нагрузки ОЗУ (%):";
         StartupSectionTitle.Text = isEn ? "STARTUP MANAGER" : "ДИСПЕТЧЕР АВТОЗАГРУЗКИ";
         BtnRefreshStartupText.Text = isEn ? "Refresh" : "Обновить";
+        UpdateThresholdLabels();
+        StartupList.Items.Refresh();
 
         UpdateToggleButtonStyles();
 
@@ -192,6 +201,8 @@ public partial class SettingsView : UserControl
             _enableGlobalHotkeys = settings.EnableGlobalHotkeys;
             _enableThresholdAlerts = settings.EnableThresholdAlerts;
             _ramThresholdValue = settings.RamAlertThreshold;
+            _intervalSeconds = settings.TelemetryInterval;
+            _diskThresholdGb = settings.DiskWarningThresholdGb;
 
             SliderHudOpacity.Value = settings.HudOpacity;
             TxtHudOpacityVal.Text = $"{settings.HudOpacity:0}%";
@@ -202,25 +213,25 @@ public partial class SettingsView : UserControl
             SliderRamAlert.Value = settings.RamAlertThreshold;
             TxtRamAlertVal.Text = $"{settings.RamAlertThreshold:0}%";
 
-            TxtIntervalCurrent.Text = LocalizationService.IsRussian
-                ? $"{settings.TelemetryInterval:0.#} сек"
-                : $"{settings.TelemetryInterval:0.#}s";
-
-            TxtThresholdCurrent.Text = LocalizationService.IsRussian
-                ? $"{settings.DiskWarningThresholdGb:0.#} ГБ"
-                : $"{settings.DiskWarningThresholdGb:0.#} GB";
+            UpdateThresholdLabels();
 
             TxtProcessWhitelist.Text = string.Join(", ", settings.ProcessWhitelist ?? new List<string>());
             TxtCustomGames.Text = string.Join(", ", settings.CustomGameProcesses ?? new List<string>());
 
             UpdateAutoRamHeading();
             UpdateToggleButtonStyles();
-            _ = RefreshStartupListAsync();
         }
         finally
         {
             _isInitializing = false;
         }
+    }
+
+    private void UpdateThresholdLabels()
+    {
+        bool isRu = _currentLanguage == "RU";
+        TxtIntervalCurrent.Text = isRu ? $"{_intervalSeconds:0.#} сек" : $"{_intervalSeconds:0.#}s";
+        TxtThresholdCurrent.Text = isRu ? $"{_diskThresholdGb:0.#} ГБ" : $"{_diskThresholdGb:0.#} GB";
     }
 
     public void UpdateToggleButtonStyles()
@@ -552,55 +563,30 @@ public partial class SettingsView : UserControl
     {
         if (StickyAccordionBar == null || SettingsScrollViewer == null) return;
 
-        Expander? activeExp = null;
-        if (ExpCustom?.IsExpanded == true) activeExp = ExpCustom;
-        else if (ExpMonitor?.IsExpanded == true) activeExp = ExpMonitor;
-        else if (ExpSysInfo?.IsExpanded == true) activeExp = ExpSysInfo;
-
-        if (activeExp == null)
+        _stickyExpander = null;
+        foreach (var exp in new[] { ExpCustom, ExpMonitor, ExpSysInfo })
         {
-            StickyAccordionBar.Visibility = Visibility.Collapsed;
-            return;
-        }
-
-        try
-        {
-            Point p = activeExp.TransformToAncestor(SettingsScrollViewer).Transform(new Point(0, 0));
-            double bottomY = p.Y + activeExp.ActualHeight;
-            bool mainHeaderScrolledOff = (p.Y + 46 <= 0) && (bottomY > 80);
-            if (mainHeaderScrolledOff)
+            if (exp?.IsExpanded != true || !SettingsScrollViewer.IsAncestorOf(exp)) continue;
+            if (_accordionCollapsing.TryGetValue(exp, out bool collapsing) && collapsing) continue;
+            double top = exp.TransformToAncestor(SettingsScrollViewer).Transform(new Point(0, 0)).Y;
+            if (top + 46 <= 0 && top + exp.ActualHeight > 80)
             {
-                StickyAccordionBar.Visibility = Visibility.Visible;
-                StickyAccordionTitle.Text = activeExp.Header?.ToString() ?? "Settings";
-            }
-            else
-            {
-                StickyAccordionBar.Visibility = Visibility.Collapsed;
+                _stickyExpander = exp;
+                StickyAccordionTitle.Text = exp.Header?.ToString() ?? "Settings";
+                break;
             }
         }
-        catch
-        {
-            StickyAccordionBar.Visibility = Visibility.Collapsed;
-        }
+        StickyAccordionBar.Visibility = _stickyExpander == null ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void BtnCollapseSticky_Click(object sender, MouseButtonEventArgs e)
     {
         StickyAccordionBar.Visibility = Visibility.Collapsed;
-        if (ExpCustom?.IsExpanded == true && ExpCustom.Content is FrameworkElement c1)
+        if (_stickyExpander is { IsExpanded: true, Content: FrameworkElement content } exp)
         {
-            AnimateCollapse(ExpCustom, c1);
-            SettingsScrollViewer?.ScrollToTop();
-        }
-        else if (ExpMonitor?.IsExpanded == true && ExpMonitor.Content is FrameworkElement c2)
-        {
-            AnimateCollapse(ExpMonitor, c2);
-            SettingsScrollViewer?.ScrollToTop();
-        }
-        else if (ExpSysInfo?.IsExpanded == true && ExpSysInfo.Content is FrameworkElement c3)
-        {
-            AnimateCollapse(ExpSysInfo, c3);
-            SettingsScrollViewer?.ScrollToTop();
+            var offset = exp.TransformToAncestor(SettingsScrollViewer).Transform(new Point(0, 0)).Y;
+            AnimateCollapse(exp, content);
+            SettingsScrollViewer.ScrollToVerticalOffset(SettingsScrollViewer.VerticalOffset + offset);
         }
     }
 
@@ -613,6 +599,9 @@ public partial class SettingsView : UserControl
     // Hardware Specs
     private async Task LoadSysInfoAsync()
     {
+        if (_sysInfoLoading) return;
+        _sysInfoLoading = true;
+        bool languageChanged = false;
         try
         {
             SysInfoLoadingText.Visibility = Visibility.Visible;
@@ -631,6 +620,9 @@ public partial class SettingsView : UserControl
                 _cachedUptime = SystemInfoService.GetUptime(isEn);
             });
 
+            languageChanged = isEn != LocalizationService.IsEnglish;
+            if (languageChanged) return;
+
             _sysInfoLoaded = true;
             PopulateSpecsUI();
         }
@@ -638,6 +630,11 @@ public partial class SettingsView : UserControl
         {
             Logger.Error("Failed to load sysinfo", ex);
             SysInfoLoadingText.Text = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            _sysInfoLoading = false;
+            if (languageChanged && ExpSysInfo.IsExpanded) _ = LoadSysInfoAsync();
         }
     }
 
@@ -898,9 +895,12 @@ public partial class SettingsView : UserControl
     // Async Startup & Network refresh
     public async Task RefreshStartupListAsync()
     {
+        if (_startupChanging) return;
+        int version = ++_startupRefreshVersion;
         try
         {
             var items = await Task.Run(() => StartupService.GetAllEntries());
+            if (version != _startupRefreshVersion) return;
             _startupEntries = items;
             StartupList.ItemsSource = _startupEntries;
         }
@@ -913,34 +913,33 @@ public partial class SettingsView : UserControl
     private void BtnStartupToggle_Click(object sender, RoutedEventArgs e)
     {
         if (sender is Button btn && btn.Tag is StartupEntry entry)
-        {
-            bool isEn = LocalizationService.IsEnglish;
-            var res = StartupService.SetEntryEnabled(entry, !entry.IsEnabled, isEn);
-            if (res.Success)
-            {
-                _ = RefreshStartupListAsync();
-            }
-            else
-            {
-                OnStatusChanged?.Invoke(res.Message);
-            }
-        }
+            _ = ChangeStartupEntryAsync(entry, remove: false);
     }
 
     private void BtnStartupDelete_Click(object sender, RoutedEventArgs e)
     {
         if (sender is Button btn && btn.Tag is StartupEntry entry)
+            _ = ChangeStartupEntryAsync(entry, remove: true);
+    }
+
+    private async Task ChangeStartupEntryAsync(StartupEntry entry, bool remove)
+    {
+        if (_startupChanging) return;
+        _startupChanging = true;
+        _startupRefreshVersion++;
+        StartupList.IsEnabled = false;
+        try
         {
             bool isEn = LocalizationService.IsEnglish;
-            var res = StartupService.DeleteEntry(entry, isEn);
-            if (res.Success)
-            {
-                _ = RefreshStartupListAsync();
-            }
-            else
-            {
-                OnStatusChanged?.Invoke(res.Message);
-            }
+            var result = await Task.Run(() => remove ? StartupService.DeleteEntry(entry, isEn) : StartupService.SetEntryEnabled(entry, !entry.IsEnabled, isEn));
+            if (!result.Success) OnStatusChanged?.Invoke(result.Message);
+        }
+        catch (Exception ex) { Logger.Error("Startup entry change failed", ex); }
+        finally
+        {
+            _startupChanging = false;
+            await RefreshStartupListAsync();
+            StartupList.IsEnabled = true;
         }
     }
 

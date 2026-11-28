@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -25,6 +26,11 @@ public partial class MainWindow : Window
     private TrayAndHotkeyService? _trayService;
     private bool _isSamplingTelemetry = false;
     private bool _isRamPurging = false;
+    private bool _isCpuOptimizing;
+    private bool _isStandbyPurging;
+    private bool _isClosing;
+    private readonly CancellationTokenSource _lifetime = new();
+    private CancellationTokenSource _automaticBoost = new();
     private bool _mcXmxWarned = false;
     private DateTime _lastCpuAlertBalloon = DateTime.MinValue;
     private DateTime _lastRamAlertBalloon = DateTime.MinValue;
@@ -88,7 +94,7 @@ public partial class MainWindow : Window
             _trayService.OnRestoreRequested += RestoreFromTray;
             _trayService.OnToggleHudRequested += ToggleHudWindow;
             _trayService.OnToggleHudLockRequested += ToggleHudClickThrough;
-            _trayService.OnQuickPurgeRequested += ExecuteQuickPurge;
+            _trayService.OnQuickPurgeRequested += () => _ = ExecuteRamPurgeAsync();
             _trayService.OnExitRequested += ExitApplicationFromTray;
             _trayService.Initialize(_settings.EnableGlobalHotkeys);
         };
@@ -122,6 +128,8 @@ public partial class MainWindow : Window
         _ = ViewStorage.ScanJunkAsync(showLog: false);
     }
 
+    internal bool CanRestoreFromTray => _trayService?.IsTrayAvailable == true;
+
     private void HandleSettingsError(string msg)
     {
         if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
@@ -134,20 +142,12 @@ public partial class MainWindow : Window
     private void WireViewEvents()
     {
         // Overview View
-        ViewOverview.OnCpuClicked += () =>
-        {
-            SetPurgeTabMode(isCpu: true);
-            HighlightTab(1);
-        };
-        ViewOverview.OnRamClicked += () =>
-        {
-            SetPurgeTabMode(isCpu: false);
-            HighlightTab(1);
-        };
+        ViewOverview.OnCpuClicked += () => OpenPurgeTab(isCpu: true);
+        ViewOverview.OnRamClicked += () => OpenPurgeTab(isCpu: false);
         ViewOverview.OnDiskCClicked += () => OpenDriveExplorer(_watchedDriveLetter);
         ViewOverview.OnDiskDClicked += () => OpenSecondaryDriveExplorer();
         ViewOverview.OnDiskDropdownClicked += fe => ShowDiskDropdown(fe);
-        ViewOverview.OnQuickPurgeClicked += () => ExecuteQuickPurge();
+        ViewOverview.OnQuickPurgeClicked += () => _ = ExecuteRamPurgeAsync();
         ViewOverview.OnToggleHudClicked += () => ToggleHudWindow();
         ViewOverview.OnCleanJunkClicked += () => HighlightTab(2);
 
@@ -165,8 +165,8 @@ public partial class MainWindow : Window
         ViewStorage.ShowConfirmDialogAsync = ShowModernConfirmDialogAsync;
 
         // Games View
-        ViewGames.OnBoostPriorityRequested += () => ExecuteGameBoost();
-        ViewGames.OnRefreshActiveGamesRequested += () => PollActiveGames();
+        ViewGames.OnBoostPriorityRequested += () => _ = ExecuteGameBoostAsync();
+        ViewGames.OnRefreshActiveGamesRequested += UpdateTelemetry;
         ViewGames.OnGameDriveFilterRequested += fe => ShowGameDriveFilterDropdown(fe);
         ViewGames.OnIncludeLaunchersChanged += val =>
         {
@@ -200,11 +200,7 @@ public partial class MainWindow : Window
         };
         ViewSettings.OnAutoGamePriorityChanged += val =>
         {
-            _autoGamePriorityEnabled = val;
-            if (!val)
-            {
-                GameBoostService.RestoreAllGamePriorities();
-            }
+            SetAutomaticGamePriority(val);
             SaveCurrentUserSettings();
             StatusFooterText.Text = val
                 ? (LocalizationService.IsEnglish ? "Automatic Game Priority enabled." : "Автоматический Game Priority включен.")
@@ -232,7 +228,7 @@ public partial class MainWindow : Window
         };
         ViewSettings.OnExportBackupRequested += () => ExportBackupToCsb();
         ViewSettings.OnImportBackupRequested += () => _ = ImportBackupFromCsbAsync();
-        ViewSettings.OnExportReportRequested += () => ExportSystemReport();
+        ViewSettings.OnExportReportRequested += () => _ = ExportSystemReportAsync();
         ViewSettings.OnRunAtStartupChanged += val =>
         {
             if (SettingsPersistenceService.SetRunAtStartup(val))
@@ -272,7 +268,7 @@ public partial class MainWindow : Window
         _cpuAlertThreshold = _settings.CpuAlertThreshold > 0 ? _settings.CpuAlertThreshold : 90.0;
         _ramAlertThreshold = _settings.RamAlertThreshold > 0 ? _settings.RamAlertThreshold : 85.0;
         _autoRamPurgeEnabled = _settings.AutoRamPurge;
-        _autoGamePriorityEnabled = _settings.AutoGamePriority;
+        SetAutomaticGamePriority(_settings.AutoGamePriority);
         if (!string.IsNullOrWhiteSpace(_settings.WatchedDriveLetter))
         {
             _watchedDriveLetter = SettingsPersistenceService.NormalizeDriveLetter(_settings.WatchedDriveLetter);
@@ -283,6 +279,16 @@ public partial class MainWindow : Window
         ViewGames.SetIncludeLaunchers(_settings.IncludeLaunchers);
         ViewStorage.BindSettings(_settings, SaveCurrentUserSettings);
         ViewSettings.InitSettings(_settings, _isLightTheme);
+    }
+
+    private void SetAutomaticGamePriority(bool enabled)
+    {
+        if (_autoGamePriorityEnabled == enabled) return;
+        _automaticBoost.Cancel();
+        _automaticBoost.Dispose();
+        _automaticBoost = new CancellationTokenSource();
+        _autoGamePriorityEnabled = enabled;
+        if (!enabled) GameBoostService.RestoreAllGamePriorities();
     }
 
     private void SaveCurrentUserSettings()
@@ -341,7 +347,7 @@ public partial class MainWindow : Window
 
     private async Task UpdateTelemetryAsync()
     {
-        if (_isSamplingTelemetry) return;
+        if (_isClosing || _isSamplingTelemetry) return;
         _isSamplingTelemetry = true;
 
         try
@@ -351,6 +357,8 @@ public partial class MainWindow : Window
             var customGames = _settings.CustomGameProcesses?.ToArray() ?? Array.Empty<string>();
             var whitelist = _settings.ProcessWhitelist?.ToArray() ?? Array.Empty<string>();
             bool autoBoostGames = _autoGamePriorityEnabled;
+            var autoBoostToken = _automaticBoost.Token;
+            bool checkMinecraft = !_mcXmxWarned;
 
             var data = await Task.Run(() =>
             {
@@ -371,6 +379,7 @@ public partial class MainWindow : Window
                     knownActiveGame: knownGame);
 
                 var extMem = MemoryService.GetPerformanceDetails();
+                MemoryService.PruneExitedBackgroundProcesses();
                 var watchedInfo = StorageService.GetDriveInfo(watchedLetter);
                 string cpuName = HardwareTelemetry.GetProcessorName();
                 int physCores = HardwareTelemetry.GetPhysicalCoreCount();
@@ -379,29 +388,40 @@ public partial class MainWindow : Window
                 {
                     if (autoBoostGames && activeGames.Any(g => !g.IsHighPriority))
                     {
-                        GameBoostService.BoostGames(!isEn, customGames, whitelist);
+                        GameBoostService.BoostGames(!isEn, customGames, whitelist, autoBoostToken);
                     }
                 }
                 else
                 {
-                    GameBoostService.RestoreAllGamePriorities();
+                    GameBoostService.RestoreAllGamePriorities(autoBoostToken);
                 }
 
-                return (sample, watchedInfo, activeGames, cpuName, physCores, extMem);
+                bool checkedMinecraft = checkMinecraft && sample.RamTotalBytes > 0 &&
+                    activeGames.Any(g => g.DisplayName.Contains("Minecraft", StringComparison.OrdinalIgnoreCase) ||
+                                         g.ProcessName.Contains("java", StringComparison.OrdinalIgnoreCase));
+                string? minecraftWarning = checkedMinecraft ? GameBoostService.CheckMinecraftXmxWarning(sample.RamTotalBytes, isEn) : null;
+                return (sample, watchedInfo, activeGames, cpuName, physCores, extMem, checkedMinecraft, minecraftWarning);
             });
+
+            if (_isClosing) return;
+            if (watchedLetter != _watchedDriveLetter || isEn != LocalizationService.IsEnglish)
+            {
+                _ = Dispatcher.BeginInvoke(UpdateTelemetry);
+                return;
+            }
 
             var sample = data.sample;
             var watchedInfo = data.watchedInfo;
             var activeGames = data.activeGames;
 
-            double watchedTotalGb = watchedInfo != null ? (double)watchedInfo.TotalBytes / (1024 * 1024 * 1024) : sample.DiskCTotalGb;
-            double watchedFreeGb = watchedInfo != null ? (double)watchedInfo.FreeBytes / (1024 * 1024 * 1024) : sample.DiskCFreeGb;
+            double watchedTotalGb = watchedInfo?.TotalBytes / (1024.0 * 1024 * 1024) ?? 0;
+            double watchedFreeGb = watchedInfo?.FreeBytes / (1024.0 * 1024 * 1024) ?? 0;
 
             // Quick metrics header (tracks watched drive consistently)
             QuickCpuText.Text = $"{sample.CpuLoadPercent:0}%";
             QuickRamText.Text = sample.RamTotalBytes > 0 ? $"{sample.RamUsedPercent:0}%" : "N/A";
             QuickDiskLabel.Text = isEn ? $"Drive {watchedLetter}: " : $"Диск {watchedLetter}: ";
-            QuickDiskText.Text = isEn ? $"{watchedFreeGb:0.0} GB" : $"{watchedFreeGb:0.0} ГБ";
+            QuickDiskText.Text = watchedTotalGb <= 0 ? "—" : isEn ? $"{watchedFreeGb:0.0} GB" : $"{watchedFreeGb:0.0} ГБ";
             QuickDiskMetric.ToolTip = isEn
                 ? $"Open Drive {watchedLetter}: in Windows Explorer"
                 : $"Открыть диск {watchedLetter}: в Проводнике";
@@ -465,18 +485,18 @@ public partial class MainWindow : Window
 
             if (activeGames.Count > 0)
             {
-                GameModeDot.Fill = (Brush)FindResource("BrushTextPrimary");
+                GameModeDot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "BrushTextPrimary");
                 GameModeText.Text = isEn ? "Active" : "Активен";
-                GameModeText.Foreground = (Brush)FindResource("BrushTextPrimary");
+                GameModeText.SetResourceReference(TextBlock.ForegroundProperty, "BrushTextPrimary");
                 GameModeIndicatorPanel.ToolTip = isEn
                     ? $"Active game: {activeGames[0].DisplayName}"
                     : $"Активная игра: {activeGames[0].DisplayName}";
             }
             else
             {
-                GameModeDot.Fill = (Brush)FindResource("BrushTextMuted");
+                GameModeDot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "BrushTextMuted");
                 GameModeText.Text = isEn ? "Waiting for games" : "Ожидание игр";
-                GameModeText.Foreground = (Brush)FindResource("BrushTextSecondary");
+                GameModeText.SetResourceReference(TextBlock.ForegroundProperty, "BrushTextSecondary");
                 GameModeIndicatorPanel.ToolTip = isEn ? "Open Game Mode" : "Открыть Игровой модуль";
             }
 
@@ -516,12 +536,10 @@ public partial class MainWindow : Window
             ViewGames.UpdateActiveGames(activeGames);
             _hudWindow?.ApplySnapshot(sample);
 
-            if (!_mcXmxWarned && sample.RamTotalBytes > 0 &&
-                activeGames.Any(g => g.DisplayName.Contains("Minecraft", StringComparison.OrdinalIgnoreCase) ||
-                                     g.ProcessName.Contains("java", StringComparison.OrdinalIgnoreCase)))
+            if (data.checkedMinecraft)
             {
                 _mcXmxWarned = true;
-                string? warn = GameBoostService.CheckMinecraftXmxWarning(sample.RamTotalBytes, isEn);
+                string? warn = data.minecraftWarning;
                 if (!string.IsNullOrEmpty(warn))
                 {
                     StatusFooterText.Text = warn;
@@ -684,7 +702,7 @@ public partial class MainWindow : Window
         try
         {
             string taskmgrPath = Path.Combine(Environment.SystemDirectory, "taskmgr.exe");
-            Process.Start(new ProcessStartInfo(taskmgrPath) { UseShellExecute = true });
+            using var process = Process.Start(new ProcessStartInfo(taskmgrPath) { UseShellExecute = true });
         }
         catch (Exception ex)
         {
@@ -700,7 +718,7 @@ public partial class MainWindow : Window
         {
             string validLetter = StorageService.ValidateDriveLetter(driveLetter);
             string explorerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
-            Process.Start(new ProcessStartInfo(explorerPath, $"{validLetter}:\\") { UseShellExecute = true });
+            using var process = Process.Start(new ProcessStartInfo(explorerPath, $"{validLetter}:\\") { UseShellExecute = true });
         }
         catch (Exception ex)
         {
@@ -710,16 +728,17 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OpenSecondaryDriveExplorer()
+    private async void OpenSecondaryDriveExplorer()
     {
-        string sys = HardwareTelemetry.GetSystemDriveLetter();
-        var secondary = DriveInfo.GetDrives()
-            .FirstOrDefault(d => d.IsReady && d.DriveType == DriveType.Fixed &&
-                                 !d.Name.StartsWith(sys, StringComparison.OrdinalIgnoreCase));
-        if (secondary != null)
+        try
         {
-            OpenDriveExplorer(secondary.Name.TrimEnd('\\', ':'));
+            string sys = HardwareTelemetry.GetSystemDriveLetter();
+            var secondary = await Task.Run(() => DriveInfo.GetDrives()
+                .FirstOrDefault(d => d.DriveType == DriveType.Fixed && d.IsReady &&
+                    !d.Name.StartsWith(sys, StringComparison.OrdinalIgnoreCase)));
+            if (!_isClosing && secondary != null) OpenDriveExplorer(secondary.Name.TrimEnd('\\', ':'));
         }
+        catch (Exception ex) { Logger.Warn($"Could not resolve secondary drive: {ex.Message}"); }
     }
 
     private void ToggleHudWindow()
@@ -773,7 +792,7 @@ public partial class MainWindow : Window
 
     private async Task ExecuteRamPurgeAsync(bool isAutomatic = false)
     {
-        if (_ramCooldownRemaining > 0 || _isRamPurging) return;
+        if (_isClosing || _ramCooldownRemaining > 0 || _isRamPurging || _isCpuOptimizing) return;
         _isRamPurging = true;
 
         bool isEn = LocalizationService.IsEnglish;
@@ -783,6 +802,7 @@ public partial class MainWindow : Window
         {
             var whitelist = _settings.ProcessWhitelist?.ToList() ?? new List<string>();
             var res = await Task.Run(() => MemoryService.PurgeMemory(whitelist));
+            if (_isClosing) return;
             string freedStr = StorageService.FormatBytes(res.BytesFreed);
             string nowTime = DateTime.Now.ToString("HH:mm:ss");
 
@@ -804,26 +824,34 @@ public partial class MainWindow : Window
         {
             _isRamPurging = false;
             UpdateTelemetry();
-            StartRamCooldown(3);
+            if (!_isClosing) StartRamCooldown(3);
         }
     }
 
     private async Task ExecuteCpuOptimization()
     {
-        if (_ramCooldownRemaining > 0) return;
+        if (_isClosing || _ramCooldownRemaining > 0 || _isCpuOptimizing || _isRamPurging) return;
+        _isCpuOptimizing = true;
 
         bool isEn = LocalizationService.IsEnglish;
         StatusFooterText.Text = isEn ? "Optimizing CPU thread scheduling and background load..." : "Оптимизация очередей ЦП и фоновой нагрузки...";
 
         try
         {
-            double cpuBefore = HardwareTelemetry.Sample(includeSensors: false).CpuLoadPercent;
-            int optimizedCount = await Task.Run(() => MemoryService.OptimizeBackgroundProcesses(_settings.ProcessWhitelist));
-
-            await Task.Delay(500);
-            HardwareTelemetry.Sample(includeSensors: false);
-            await Task.Delay(800);
-            double cpuAfter = HardwareTelemetry.Sample(includeSensors: false).CpuLoadPercent;
+            var whitelist = _settings.ProcessWhitelist.ToArray();
+            var ct = _lifetime.Token;
+            var (cpuBefore, cpuAfter, optimizedCount) = await Task.Run(async () =>
+            {
+                ct.ThrowIfCancellationRequested();
+                double before = HardwareTelemetry.Sample(includeSensors: false).CpuLoadPercent;
+                int count = MemoryService.OptimizeBackgroundProcesses(whitelist, ct);
+                await Task.Delay(500, ct);
+                HardwareTelemetry.Sample(includeSensors: false);
+                await Task.Delay(800, ct);
+                double after = HardwareTelemetry.Sample(includeSensors: false).CpuLoadPercent;
+                return (before, after, count);
+            }, ct);
+            if (_isClosing) return;
 
             string nowTime = DateTime.Now.ToString("HH:mm:ss");
             string status = (cpuAfter < cpuBefore)
@@ -833,24 +861,40 @@ public partial class MainWindow : Window
             ViewPurge.Log($"[{nowTime}] {status}");
             StatusFooterText.Text = status;
         }
+        catch (OperationCanceledException) when (_isClosing) { }
         catch (Exception ex)
         {
             Logger.Error("CPU optimization error", ex);
         }
         finally
         {
+            _isCpuOptimizing = false;
             ViewPurge.UpdateVisuals();
             UpdateTelemetry();
-            StartRamCooldown(3);
+            if (!_isClosing) StartRamCooldown(3);
         }
     }
 
     private async Task ExecuteStandbyPurgeAsync()
     {
+        if (_isStandbyPurging || _isClosing) return;
+        _isStandbyPurging = true;
+        ViewPurge.SetStandbyPurgeBusy(true);
+        try { await ExecuteStandbyPurgeCoreAsync(_lifetime.Token); }
+        catch (Exception ex) { Logger.Error("Standby purge failed", ex); }
+        finally
+        {
+            _isStandbyPurging = false;
+            ViewPurge.SetStandbyPurgeBusy(false);
+        }
+    }
+
+    private async Task ExecuteStandbyPurgeCoreAsync(CancellationToken cancellationToken)
+    {
         bool isEn = LocalizationService.IsEnglish;
         if (StorageService.IsAdministrator())
         {
-            var res = MemoryService.PurgeStandbyList(isEn);
+            var res = await Task.Run(() => MemoryService.PurgeStandbyList(isEn), cancellationToken);
             string nowTime = DateTime.Now.ToString("HH:mm:ss");
             ViewPurge.Log($"[{nowTime}] {res.Message}");
             StatusFooterText.Text = res.Message;
@@ -868,7 +912,7 @@ public partial class MainWindow : Window
             isEn ? "Grant Rights" : "Дать права",
             isEn ? "Cancel" : "Отмена",
             "IconShield");
-        if (!confirmed) return;
+        if (!confirmed || _isClosing) return;
 
         ViewPurge.SetStandbyPurgeBusy(true);
         StatusFooterText.Text = isEn ? "Clearing Windows Standby List..." : "Очистка Standby List Windows...";
@@ -890,7 +934,7 @@ public partial class MainWindow : Window
             {
                 string nowTime = DateTime.Now.ToString("HH:mm:ss");
                 ViewPurge.Log($"[{nowTime}] {line}");
-            });
+            }, cancellationToken);
 
             string statusMsg = run.Result?.SummaryMessage ?? run.ErrorMessage ?? (isEn ? "Standby List cleared." : "Standby List очищен.");
             if (run.ElevationCancelled || !string.IsNullOrEmpty(run.ErrorMessage))
@@ -907,21 +951,27 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ExecuteRestoreCpu()
+    private async void ExecuteRestoreCpu()
     {
+        if (_isCpuOptimizing || _isClosing) return;
+        _isCpuOptimizing = true;
         bool isEn = LocalizationService.IsEnglish;
-        int restored = MemoryService.RestoreBackgroundProcesses();
-        ViewPurge.UpdateVisuals();
-        string nowTime = DateTime.Now.ToString("HH:mm:ss");
-        string msg = isEn
-            ? $"Restored normal priority and EcoQoS for {restored} processes."
-            : $"Восстановлен обычный приоритет и EcoQoS для {restored} процессов.";
-        ViewPurge.Log($"[{nowTime}] {msg}");
-        StatusFooterText.Text = msg;
-        UpdateTelemetry();
+        try
+        {
+            int restored = await Task.Run(MemoryService.RestoreBackgroundProcesses);
+            if (_isClosing) return;
+            ViewPurge.UpdateVisuals();
+            string nowTime = DateTime.Now.ToString("HH:mm:ss");
+            string msg = isEn ? $"Restored original priorities for {restored} processes." : $"Восстановлены исходные приоритеты {restored} процессов.";
+            ViewPurge.Log($"[{nowTime}] {msg}");
+            StatusFooterText.Text = msg;
+            UpdateTelemetry();
+        }
+        catch (Exception ex) { Logger.Error("CPU priority restore failed", ex); }
+        finally { _isCpuOptimizing = false; }
     }
 
-    private void ExportSystemReport()
+    private async Task ExportSystemReportAsync()
     {
         bool isEn = LocalizationService.IsEnglish;
         try
@@ -939,41 +989,47 @@ public partial class MainWindow : Window
             };
             if (dlg.ShowDialog(this) != true) return;
 
-            var sample = HardwareTelemetry.Sample(includeSensors: true);
-            var extMem = MemoryService.GetPerformanceDetails();
-            string cpuName = HardwareTelemetry.GetProcessorName();
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("=== CoreSpectre System Diagnostic Report ===");
-            sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine($"CPU: {cpuName} ({HardwareTelemetry.GetPhysicalCoreCount()}C / {Environment.ProcessorCount}T) @ {sample.CpuLoadPercent:0}%");
-            sb.AppendLine($"RAM: {sample.RamUsedBytes / (1024.0 * 1024 * 1024):0.00} / {sample.RamTotalBytes / (1024.0 * 1024 * 1024):0.00} GB ({sample.RamUsedPercent:0}%)");
-            if (extMem != null)
-            {
-                sb.AppendLine($"Commit Charge: {extMem.CommitTotalBytes / (1024.0 * 1024 * 1024):0.00} / {extMem.CommitLimitBytes / (1024.0 * 1024 * 1024):0.00} GB");
-                sb.AppendLine($"System Cache: {extMem.SystemCacheBytes / (1024.0 * 1024):0} MB");
-            }
-            if (sample.GpuLoadPercent.HasValue || sample.GpuTempCelsius.HasValue)
-            {
-                sb.AppendLine($"GPU: Load={sample.GpuLoadPercent?.ToString("0") ?? "N/A"}%, Temp={sample.GpuTempCelsius?.ToString("0") ?? "N/A"}°C");
-            }
-            foreach (var d in DriveInfo.GetDrives().Where(x => x.IsReady && x.DriveType == DriveType.Fixed))
-            {
-                sb.AppendLine($"Drive {d.Name}: {d.AvailableFreeSpace / (1024.0 * 1024 * 1024):0.0} GB free / {d.TotalSize / (1024.0 * 1024 * 1024):0.0} GB total");
-            }
-            sb.AppendLine();
-            sb.AppendLine("Top Processes (by RAM):");
-            foreach (var p in ProcessTrackerService.SampleProcesses(ProcessSortMode.Ram).Take(12))
-            {
-                sb.AppendLine($"  {p.DisplayName} (PID {p.Pid}): {p.FormattedRam}, CPU {p.FormattedCpu}");
-            }
-            File.WriteAllText(dlg.FileName, sb.ToString(), System.Text.Encoding.UTF8);
-            StatusFooterText.Text = isEn ? $"Report exported: {Path.GetFileName(dlg.FileName)}" : $"Отчёт сохранён: {Path.GetFileName(dlg.FileName)}";
+            string filePath = dlg.FileName;
+            await Task.Run(() => WriteSystemReport(filePath));
+            StatusFooterText.Text = isEn ? $"Report exported: {Path.GetFileName(filePath)}" : $"Отчёт сохранён: {Path.GetFileName(filePath)}";
         }
         catch (Exception ex)
         {
             Logger.Warn($"ExportSystemReport failed: {ex.Message}");
             StatusFooterText.Text = isEn ? "Failed to export report." : "Не удалось сохранить отчёт.";
         }
+    }
+
+    private static void WriteSystemReport(string filePath)
+    {
+        var sample = HardwareTelemetry.Sample(includeSensors: true);
+        var extMem = MemoryService.GetPerformanceDetails();
+        string cpuName = HardwareTelemetry.GetProcessorName();
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("=== CoreSpectre System Diagnostic Report ===");
+        sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine($"CPU: {cpuName} ({HardwareTelemetry.GetPhysicalCoreCount()}C / {Environment.ProcessorCount}T) @ {sample.CpuLoadPercent:0}%");
+        sb.AppendLine($"RAM: {sample.RamUsedBytes / (1024.0 * 1024 * 1024):0.00} / {sample.RamTotalBytes / (1024.0 * 1024 * 1024):0.00} GB ({sample.RamUsedPercent:0}%)");
+        if (extMem != null)
+        {
+            sb.AppendLine($"Commit Charge: {extMem.CommitTotalBytes / (1024.0 * 1024 * 1024):0.00} / {extMem.CommitLimitBytes / (1024.0 * 1024 * 1024):0.00} GB");
+            sb.AppendLine($"System Cache: {extMem.SystemCacheBytes / (1024.0 * 1024):0} MB");
+        }
+        if (sample.GpuLoadPercent.HasValue || sample.GpuTempCelsius.HasValue)
+        {
+            sb.AppendLine($"GPU: Load={sample.GpuLoadPercent?.ToString("0") ?? "N/A"}%, Temp={sample.GpuTempCelsius?.ToString("0") ?? "N/A"}°C");
+        }
+        foreach (var d in DriveInfo.GetDrives().Where(x => x.DriveType == DriveType.Fixed && x.IsReady))
+        {
+            sb.AppendLine($"Drive {d.Name}: {d.AvailableFreeSpace / (1024.0 * 1024 * 1024):0.0} GB free / {d.TotalSize / (1024.0 * 1024 * 1024):0.0} GB total");
+        }
+        sb.AppendLine();
+        sb.AppendLine("Top Processes (by RAM):");
+        foreach (var p in ProcessTrackerService.SampleProcesses(ProcessSortMode.Ram).Take(12))
+        {
+            sb.AppendLine($"  {p.DisplayName} (PID {p.Pid}): {p.FormattedRam}, CPU {p.FormattedCpu}");
+        }
+        File.WriteAllText(filePath, sb.ToString(), System.Text.Encoding.UTF8);
     }
 
     private void StartRamCooldown(int seconds)
@@ -992,10 +1048,23 @@ public partial class MainWindow : Window
         _ramCooldownTimer.Start();
     }
 
-    private void ExecuteGameBoost()
+    private async Task ExecuteGameBoostAsync()
     {
         bool isEn = LocalizationService.IsEnglish;
-        var res = GameBoostService.BoostGames(!isEn, _settings.CustomGameProcesses, _settings.ProcessWhitelist);
+        GameBoostResult res;
+        try
+        {
+            var customGames = _settings.CustomGameProcesses.ToArray();
+            var whitelist = _settings.ProcessWhitelist.ToArray();
+            var ct = _lifetime.Token;
+            res = await Task.Run(() => GameBoostService.BoostGames(!isEn, customGames, whitelist, ct));
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Game priority boost failed", ex);
+            return;
+        }
+        if (_isClosing) return;
         if (res.BoostedCount > 0)
         {
             StatusFooterText.Text = isEn
@@ -1012,21 +1081,19 @@ public partial class MainWindow : Window
         {
             StatusFooterText.Text = isEn ? "No active games found to boost." : "Активные игровые процессы для оптимизации не найдены.";
         }
-        PollActiveGames();
-    }
-
-    private void PollActiveGames()
-    {
-        var games = GameBoostService.GetActiveGames(!LocalizationService.IsEnglish, _settings.CustomGameProcesses, _settings.ProcessWhitelist);
-        ViewGames.UpdateActiveGames(games);
+        UpdateTelemetry();
     }
 
     // Modern Confirm Dialog
     public async Task<bool> ShowModernConfirmDialogAsync(string title, string message, string confirmText, string cancelText, string iconKey)
     {
+        if (_isClosing) return false;
         await _modalSemaphore.WaitAsync();
+        IInputElement? previousFocus = null;
         try
         {
+            if (_isClosing) return false;
+            previousFocus = Keyboard.FocusedElement;
             ModalDialogTitle.Text = title;
             ModalDialogSub.Text = LocalizationService.IsEnglish ? "Action requires confirmation" : "Действие требует подтверждения";
             ModalDialogMessage.Text = message;
@@ -1039,14 +1106,17 @@ public partial class MainWindow : Window
             }
 
             _modalTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            BackgroundHeader.IsEnabled = BackgroundWorkspace.IsEnabled = BackgroundFooter.IsEnabled = false;
             ModernModalOverlay.Visibility = Visibility.Visible;
-            bool result = await _modalTcs.Task;
-            ModernModalOverlay.Visibility = Visibility.Collapsed;
-            _modalTcs = null;
-            return result;
+            BtnModalCancel.Focus();
+            return await _modalTcs.Task;
         }
         finally
         {
+            _modalTcs = null;
+            ModernModalOverlay.Visibility = Visibility.Collapsed;
+            BackgroundHeader.IsEnabled = BackgroundWorkspace.IsEnabled = BackgroundFooter.IsEnabled = true;
+            if (!_isClosing && previousFocus != null) Keyboard.Focus(previousFocus);
             _modalSemaphore.Release();
         }
     }
@@ -1055,18 +1125,27 @@ public partial class MainWindow : Window
     private void BtnModalCancel_Click(object sender, RoutedEventArgs e) => _modalTcs?.TrySetResult(false);
 
     // Dropdown helpers
-    private void ShowDiskDropdown(FrameworkElement target)
+    private async void ShowDiskDropdown(FrameworkElement target)
     {
+        DiskInfo[] drives;
+        try
+        {
+            drives = await Task.Run(() => DriveInfo.GetDrives()
+                .Select(d => StorageService.GetDriveInfo(d.Name)).OfType<DiskInfo>().ToArray());
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Drive enumeration failed: {ex.Message}");
+            return;
+        }
+        if (_isClosing || !target.IsVisible || !target.IsEnabled) return;
         var cm = new ContextMenu { PlacementTarget = target, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
         bool isEn = LocalizationService.IsEnglish;
-        var drives = DriveInfo.GetDrives().Where(d => d.IsReady);
         foreach (var d in drives)
         {
-            string letter = d.Name.TrimEnd(':', '\\');
-            string vol = string.IsNullOrWhiteSpace(d.VolumeLabel)
-                ? (letter == "C" ? (isEn ? "System" : "Системный") : (isEn ? "Data" : "Данные"))
-                : d.VolumeLabel;
-            string freeStr = StorageService.FormatBytes(d.AvailableFreeSpace);
+            string letter = d.Name;
+            string vol = d.VolumeLabel;
+            string freeStr = StorageService.FormatBytes(d.FreeBytes);
             bool isCurrent = string.Equals(letter, _watchedDriveLetter, StringComparison.OrdinalIgnoreCase);
 
             var item = new MenuItem
@@ -1077,6 +1156,7 @@ public partial class MainWindow : Window
             item.Click += (s, ev) =>
             {
                 _watchedDriveLetter = letter;
+                ViewStorage.UpdateCapacity(letter, 0, 0);
                 SaveCurrentUserSettings();
                 UpdateTelemetry();
                 ApplyLanguageStrings();
@@ -1111,8 +1191,20 @@ public partial class MainWindow : Window
         cm.IsOpen = true;
     }
 
-    private void ShowGameDriveFilterDropdown(FrameworkElement target)
+    private async void ShowGameDriveFilterDropdown(FrameworkElement target)
     {
+        DriveInfo[] drives;
+        try
+        {
+            drives = await Task.Run(() => DriveInfo.GetDrives()
+                .Where(d => (d.DriveType is DriveType.Fixed or DriveType.Removable) && d.IsReady).ToArray());
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Game drive enumeration failed: {ex.Message}");
+            return;
+        }
+        if (_isClosing || !target.IsVisible || !target.IsEnabled) return;
         var cm = new ContextMenu { PlacementTarget = target, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
         bool isEn = LocalizationService.IsEnglish;
 
@@ -1124,7 +1216,6 @@ public partial class MainWindow : Window
         allItem.Click += (s, e) => ViewGames.UpdateDriveFilter("ALL");
         cm.Items.Add(allItem);
 
-        var drives = DriveInfo.GetDrives().Where(d => d.IsReady && (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable));
         foreach (var d in drives)
         {
             string letter = d.Name.TrimEnd(':', '\\');
@@ -1348,6 +1439,7 @@ public partial class MainWindow : Window
         LoadAndApplyUserSettings();
         _trayService?.SetHotkeysEnabled(_settings.EnableGlobalHotkeys);
         InitNavigationTabs();
+        if (!_activeTabs.Any(t => t.TagIndex == _currentTabIndex)) HighlightTab(_activeTabs[0].TagIndex);
         _telemetryTimer.Interval = TimeSpan.FromSeconds(_telemetryIntervalSeconds);
         ApplyLanguageStrings();
         SetTheme(_isLightTheme);
@@ -1418,7 +1510,8 @@ public partial class MainWindow : Window
         bool isEn = LocalizationService.IsEnglish;
         try
         {
-            var (ok, imported, message) = SettingsPersistenceService.ImportBackup(filePath, isEn);
+            var (ok, imported, message) = await Task.Run(() => SettingsPersistenceService.ImportBackup(filePath, isEn));
+            if (_isClosing) return;
             if (!ok || imported == null)
             {
                 StatusFooterText.Text = message;
@@ -1453,12 +1546,14 @@ public partial class MainWindow : Window
 
     public void HandleExternalCsbOpen(string? csbPath)
     {
+        if (_isClosing) return;
         RestoreFromTray();
         Topmost = true;
         Topmost = false;
         Activate();
 
-        if (!string.IsNullOrWhiteSpace(csbPath) && File.Exists(csbPath))
+        if (!string.IsNullOrWhiteSpace(csbPath) && Path.IsPathFullyQualified(csbPath) &&
+            Path.GetExtension(csbPath).Equals(".csb", StringComparison.OrdinalIgnoreCase))
         {
             _ = ImportBackupFileAsync(csbPath);
         }
@@ -1529,6 +1624,7 @@ public partial class MainWindow : Window
     private void RebuildNavPills()
     {
         if (NavPillsContainer == null) return;
+        FinishTabDrag(commit: false);
         NavPillsContainer.Children.Clear();
         bool isEn = LocalizationService.IsEnglish;
 
@@ -1566,7 +1662,7 @@ public partial class MainWindow : Window
             };
             btn.Click += (s, e) => HighlightTab(tab.TagIndex);
 
-            var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var sp = new DockPanel { VerticalAlignment = VerticalAlignment.Center };
             if (TryFindResource(tab.IconKey) is Geometry geom)
             {
                 var path = new System.Windows.Shapes.Path
@@ -1659,6 +1755,7 @@ public partial class MainWindow : Window
 
     public void HighlightTab(int index)
     {
+        if (!_activeTabs.Any(t => t.TagIndex == index)) return;
         _currentTabIndex = index;
 
         if (index != 4)
@@ -1756,7 +1853,7 @@ public partial class MainWindow : Window
                 bool ok = await ShowModernConfirmDialogAsync(title, msg, isEn ? "Remove" : "Удалить", isEn ? "Cancel" : "Отмена", "IconClose");
                 if (!ok) return;
 
-                _activeTabs.Remove(tab);
+                if (!_activeTabs.Remove(tab)) return;
                 if (!_vaultTabs.Contains(tab))
                 {
                     _vaultTabs.Add(tab);
@@ -1816,7 +1913,7 @@ public partial class MainWindow : Window
                 _dragStartPoint = e.GetPosition(NavPillsContainer);
                 _draggedRow.Opacity = 0.85;
                 Panel.SetZIndex(_draggedRow, 999);
-                grip.CaptureMouse();
+                if (!grip.CaptureMouse()) FinishTabDrag(commit: false);
                 e.Handled = true;
             }
         }
@@ -1853,44 +1950,37 @@ public partial class MainWindow : Window
         }
     }
 
-    private void CommitDrop()
+    private void FinishTabDrag(bool commit)
     {
-        if (_draggedTab != null && _dragStartIndex >= 0 && _targetDropIndex >= 0 && _dragStartIndex != _targetDropIndex)
-        {
-            var tab = _draggedTab;
-            int from = _dragStartIndex;
-            int to = _targetDropIndex;
-            _draggedTab = null;
-            _draggedRow = null;
-            _dragStartIndex = -1;
-            _targetDropIndex = -1;
+        if (_draggedTab is not { } tab) return;
+        var row = _draggedRow;
+        int from = _dragStartIndex;
+        int to = _targetDropIndex;
+        _draggedTab = null;
+        _draggedRow = null;
+        _dragStartIndex = _targetDropIndex = -1;
 
+        if (row != null)
+        {
+            row.Opacity = 1;
+            Panel.SetZIndex(row, 0);
+            if (row.IsMouseCaptureWithin) Mouse.Capture(null);
+        }
+        foreach (UIElement child in NavPillsContainer.Children)
+            child.RenderTransform = null;
+
+        if (commit && from >= 0 && to >= 0 && from != to)
+        {
             _activeTabs.RemoveAt(from);
             _activeTabs.Insert(to, tab);
             RebuildNavPills();
             SaveCurrentUserSettings();
-            return;
-        }
-        if (_draggedTab != null)
-        {
-            _draggedTab = null;
-            _draggedRow = null;
-            _dragStartIndex = -1;
-            _targetDropIndex = -1;
-            RebuildNavPills();
         }
     }
 
-    private void TabGrip_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-    {
-        CommitDrop();
-        if (sender is FrameworkElement grip && grip.IsMouseCaptured)
-        {
-            grip.ReleaseMouseCapture();
-        }
-    }
+    private void TabGrip_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e) => FinishTabDrag(commit: true);
 
-    private void TabGrip_LostMouseCapture(object sender, MouseEventArgs e) => CommitDrop();
+    private void TabGrip_LostMouseCapture(object sender, MouseEventArgs e) => FinishTabDrag(commit: false);
 
     private static T? FindVisualParent<T>(DependencyObject child) where T : DependencyObject
     {
@@ -1948,16 +2038,14 @@ public partial class MainWindow : Window
 
     private void ExitApplicationFromTray() => Close();
 
-    private void CpuMetric_Click(object sender, MouseButtonEventArgs e)
+    private void OpenPurgeTab(bool isCpu)
     {
-        SetPurgeTabMode(isCpu: true);
+        if (!_activeTabs.Any(t => t.TagIndex == 1)) return;
+        SetPurgeTabMode(isCpu);
         HighlightTab(1);
     }
-    private void RamMetric_Click(object sender, MouseButtonEventArgs e)
-    {
-        SetPurgeTabMode(isCpu: false);
-        HighlightTab(1);
-    }
+    private void CpuMetric_Click(object sender, MouseButtonEventArgs e) => OpenPurgeTab(isCpu: true);
+    private void RamMetric_Click(object sender, MouseButtonEventArgs e) => OpenPurgeTab(isCpu: false);
     private void DiskMetric_Click(object sender, MouseButtonEventArgs e) => OpenDriveExplorer(_watchedDriveLetter);
     private void GameModeIndicator_Click(object sender, MouseButtonEventArgs e) => HighlightTab(3);
     private void BtnToggleHud_Click(object sender, RoutedEventArgs e) => ToggleHudWindow();
@@ -1974,23 +2062,37 @@ public partial class MainWindow : Window
             if (ModernModalOverlay.Visibility == Visibility.Visible)
             {
                 _modalTcs?.TrySetResult(false);
+                e.Handled = true;
+            }
+            else if (_draggedTab != null)
+            {
+                FinishTabDrag(commit: false);
+                e.Handled = true;
             }
         }
     }
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
-        _modalTcs?.TrySetResult(false);
         base.OnClosing(e);
+        if (e.Cancel) return;
+        _isClosing = true;
+        _modalTcs?.TrySetResult(false);
     }
 
     protected override void OnClosed(EventArgs e)
     {
         SettingsPersistenceService.OnSettingsError -= HandleSettingsError;
+        _automaticBoost.Cancel();
+        _lifetime.Cancel();
+        _automaticBoost.Dispose();
+        _lifetime.Dispose();
         SaveCurrentUserSettings();
         GameBoostService.RestoreAllGamePriorities();
+        MemoryService.RestoreBackgroundProcesses();
         _telemetryTimer.Stop();
         _clockTimer.Stop();
+        _ramCooldownTimer?.Stop();
         ViewStorage.StopAutoScan();
         _trayService?.Dispose();
         _trayService = null;

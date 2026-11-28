@@ -11,6 +11,7 @@ namespace CoreSpectre.Views;
 public partial class PurgeView : UserControl
 {
     private bool _isCpuPurgeMode = false;
+    private bool _isStandbyBusy;
 
     public event Action? OnPurgeRequested;
     public event Action? OnStandbyPurgeRequested;
@@ -33,6 +34,7 @@ public partial class PurgeView : UserControl
 
     public void SetStandbyPurgeBusy(bool isBusy)
     {
+        _isStandbyBusy = isBusy;
         bool isEn = LocalizationService.IsEnglish;
         BtnPurgeStandby.IsEnabled = !isBusy;
         BtnPurgeStandbyText.Text = isBusy
@@ -43,6 +45,7 @@ public partial class PurgeView : UserControl
     public void UpdateVisuals()
     {
         bool isEn = LocalizationService.IsEnglish;
+        BtnSwitchPurgeMode.ToolTip = isEn ? "Switch between RAM and CPU modes" : "Переключить режим ОЗУ / ЦП";
 
         if (_isCpuPurgeMode)
         {
@@ -89,7 +92,7 @@ public partial class PurgeView : UserControl
 
             ExtendedMemPanel.Visibility = Visibility.Visible;
             BtnPurgeStandby.Visibility = Visibility.Visible;
-            BtnPurgeStandbyText.Text = isEn ? "Clear Standby" : "Сбросить Standby";
+            SetStandbyPurgeBusy(_isStandbyBusy);
             BtnRestoreCpu.Visibility = Visibility.Collapsed;
 
             RamHeroIcon.Data = (Geometry)FindResource("IconRam");
@@ -152,7 +155,7 @@ public partial class PurgeView : UserControl
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.Invoke(() => Log(line));
+            if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(() => Log(line));
             return;
         }
 
